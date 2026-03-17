@@ -39,3 +39,10 @@
 
 ## 📷 Introduction
 **TL;DR:** We propose CamCloneMaster, a novel **causal multi-shot architecture** that enables **interactive storytelling** and **efficient on-the-fly frame generation**, achieving **16 FPS** on a single NVIDIA GPU.
+
+<div align="center">
+  <video controls>
+    <source src="figs/demo.mp4" type="video/mp4">
+    您的浏览器不支持 HTML5 视频标签。
+  </video>
+</div>
