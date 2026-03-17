@@ -46,3 +46,6 @@
     您的浏览器不支持 HTML5 视频标签。
   </video>
 </div>
+
+## ⚙️ Code: ShotStream + Wan2.1-T2V-1.3B (Inference & Training)
+### Inference
