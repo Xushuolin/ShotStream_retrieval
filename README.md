@@ -47,6 +47,7 @@
   </video>
 </div>
 
+Please watch more video results in our [Project Page](https://luo0207.github.io/ShotStream/)
 ## ⚙️ Code: ShotStream + Wan2.1-T2V-1.3B (Inference & Training)
 ### Inference
 **1.** **Environment**: Create a conda environment and install dependencies:
@@ -61,14 +62,21 @@ pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorc
 pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 ```
+or directly: 
+```bash
+bash tools/setup/env.sh
+```
 
 **2. Download checkpoints**:
 Download the ckpt of Wan-T2V-1.3B and ShotStream
 ```bash
 apt-get install git-lfs
 git-lfs install
-git clone https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B
-git clone https://huggingface.co/KlingTeam/ShotStream
+git clone https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B wan_models
+git clone https://huggingface.co/KlingTeam/ShotStream ckpts
 ```
-
+or directly: 
+```bash
+bash tools/setup/download_ckpt.sh
+```
 **3. Autoregressive 4-step Long Multi-Shot Video Generation**
