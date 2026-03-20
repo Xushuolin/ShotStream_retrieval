@@ -86,8 +86,12 @@ bash tools/inference/causal_fewsteps.sh
 
 
 ### Training
-#### Step 1: Bidirectional Next-Shot Teacher Model Training
-**Note:** You need to update `MASTER_ADDR` in [tools/train/1_basemodel.sh]() with the main node's IP address. For multi-node training, the `NNODES` variable also needs to be modified accordingly.
+
+### Step 1: Bidirectional Next-Shot Teacher Model Training
+**Note:** 
+1. You need to update `MASTER_ADDR` in [tools/train/1_basemodel.sh]() with the main node's IP address. For multi-node training, the `NNODES` variable also needs to be modified accordingly.
+
+2. The multi-shot video example provided is sourced from a public dataset for demonstration purposes. Its captions differ from those used in our actual training set.
 
 **Single node:** 
 ```bash
@@ -102,3 +106,9 @@ bash tools/train/1_basemodel.sh 0
 bash tools/train/1_basemodel.sh 1
 ...
 ```
+
+### Step 2: Causal Student Model Distillation
+**Step 2.1 Causal Adaptation Initialization**: Following [CausVid](https://arxiv.org/pdf/2412.07772v1), we initialize the causal student with the bidirectional teacher's weights. Training all parameters on 5K teacher ODE solution pairs aligns their trajectories, bridging the architectural gap and stabilizing subsequent distillation.
+
+**Step 2.1.1 Get ODE Pairs from Teacher**
+
