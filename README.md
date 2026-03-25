@@ -11,8 +11,8 @@
     <a href="https://xiaoyushi97.github.io/">Xiaoyu Shi</a><sup>2,✉</sup>
     <a href="https://zhuang2002.github.io/">Junhao Zhuang</a><sup>1</sup>
     <a href="https://yutian10.github.io/">Yutian Chen</a><sup>1</sup>
-    <a href="https://liuquande.github.io/">Quande Liu</a><sup>2</sup>
-    <a href="https://xinntao.github.io/">Xintao Wang</a><sup>2</sup><br>
+    <a href="https://liuquande.github.io/">Quande Liu</a><sup>2</sup><br>
+    <a href="https://xinntao.github.io/">Xintao Wang</a><sup>2</sup>
     <a href="https://magicwpf.github.io/">Pengfei Wan</a><sup>2</sup>
     <a href="https://tianfan.info/">Tianfan Xue</a><sup>1,3,✉</sup>
   </p>
