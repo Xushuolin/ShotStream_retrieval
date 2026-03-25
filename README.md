@@ -24,13 +24,7 @@
   </p>
 </div>
 
-<p align="center">
-  <a href='https://luo0207.github.io/ShotStream/'><img src='https://img.shields.io/badge/Project-Page-Green'></a>
-  &nbsp;
-  <a href=""><img src="https://img.shields.io/static/v1?label=Arxiv&message=ShotStream&color=red&logo=arxiv"></a>
-  &nbsp;
-  <a href='https://huggingface.co/KlingTeam/ShotStream'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Checkpoint-orange'></a>
-</p>
+https://github.com/KlingAIResearch/ShotStream/blob/main/figs/demo.mp4
 
 **Note:** This open-source repository is a reference implementation. Please note that the original model utilizes internal data, and the prompts in these demo cases exhibit a distribution gap compared to our original training and inference phases.
 
