@@ -25,7 +25,7 @@
 </div>
 
 ## 📋 Table of Contents
-- [� Table of Contents](#-table-of-contents)
+- [📋 Table of Contents](#-table-of-contents)
 - [🔥 Updates](#-updates)
 - [📷 Introduction](#-introduction)
 - [⚙️ Code: ShotStream + Wan2.1-T2V-1.3B](#️-code-shotstream--wan21-t2v-13b)
