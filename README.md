@@ -30,6 +30,8 @@
   <a href="https://arxiv.org/abs/2603.25746"><img src="https://img.shields.io/static/v1?label=Arxiv&message=ShotStream&color=red&logo=arxiv"></a>
   &nbsp;
   <a href='https://huggingface.co/KlingTeam/ShotStream/'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange'></a>
+  &nbsp;
+  <a href='#-citation'><img src='https://img.shields.io/badge/BibTeX-Cite-blue?logo=google-scholar'></a>
 </p>
 
 ## 📋 Table of Contents
