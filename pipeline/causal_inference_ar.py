@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from model.base import FrameConcatCausalModel
 import math
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -41,7 +42,9 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.dynamic_sample_frames = getattr(args, "dynamic_sample_frames", False)
         self.change_rope = getattr(args, "change_rope", False)
         self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
-        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 2)
+        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
+        self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
+        self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
 
         self.multi_caption  = getattr(args, "multi_caption", False)
@@ -50,6 +53,23 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         if hasattr(args, 'adapter') and args.adapter is not None:
             self.is_lora_enabled = True
             self.lora_config = args.adapter
+
+    @torch.no_grad()
+    def _encode_shot_query(self, shot_prompt: str, device: torch.device):
+        cond = self.text_encoder(text_prompts=[shot_prompt])
+        query = cond["prompt_embeds"][0].mean(dim=0).to(device)
+        return query
+
+    @torch.no_grad()
+    def _should_use_retrieval(self, prev_query_embed: torch.Tensor, cur_query_embed: torch.Tensor):
+        if prev_query_embed is None or cur_query_embed is None:
+            return True, float("nan")
+        sim = F.cosine_similarity(prev_query_embed, cur_query_embed, dim=0).item()
+        # Two-way routing only:
+        #   high similarity -> fast heuristic context sampling
+        #   low similarity  -> semantic retrieval
+        use_retrieval = sim < self.route_retrieval_cosine_threshold
+        return use_retrieval, sim
 
     @torch.no_grad()
     def _build_candidate_entries(self, shot_flags: torch.Tensor, latent_gen_iter: int):
@@ -169,11 +189,14 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         # Save generated results
         output_images_list = []
         shot_flags_output = []
+        prev_shot_query_embed = None
 
         for latent_gen_iter in range(len(shot_flags_unique_gt)):
             print(f"shot {latent_gen_iter} begin")
             shot_flags = torch.tensor(shot_flags_output).to(torch.int32) 
             shot_flags_unique = torch.unique(shot_flags)
+            current_shot_query = shots_captions[0][latent_gen_iter][0][0]
+            current_shot_query_embed = self._encode_shot_query(current_shot_query, device)
 
             if self.dynamic_sample_frames:
                 if latent_gen_iter > 0:
@@ -204,10 +227,20 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             else:
                 video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
                 video_data = rearrange(video_data, 'f c h w -> f h w c')
-                if self.semantic_retrieval_context:
+                use_retrieval = self.semantic_retrieval_context
+                if self.route_retrieval_by_prompt_similarity:
+                    use_retrieval, sim = self._should_use_retrieval(
+                        prev_query_embed=prev_shot_query_embed,
+                        cur_query_embed=current_shot_query_embed,
+                    )
+                    print(
+                        f"[Routing] shot={latent_gen_iter}, cosine(prev,cur)={sim:.4f}, "
+                        f"use_retrieval={use_retrieval}, threshold={self.route_retrieval_cosine_threshold}"
+                    )
+                if use_retrieval:
                     # Retrieval query should come from current-shot prompt only
                     # (exclude global prompt to avoid retrieval bias).
-                    query_text = shots_captions[0][latent_gen_iter][0][0]
+                    query_text = current_shot_query
                     candidate_entries = self._build_candidate_entries(shot_flags, latent_gen_iter)
                     selected_indices, selected_shot_flags = self._kv_retrieval_topk_history(
                         history_video=video_data,
@@ -441,6 +474,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
             output_images_list.append(video[0])
             shot_flags_output += [latent_gen_iter] * video.shape[1]
+            prev_shot_query_embed = current_shot_query_embed.detach()
             print(f"shot {latent_gen_iter} end")
 
         video = torch.concat(output_images_list, dim=0)

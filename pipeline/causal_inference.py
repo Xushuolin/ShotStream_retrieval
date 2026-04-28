@@ -53,7 +53,7 @@ class CausalInferencePipeline(FrameConcatCausalModel):
         self.dynamic_sample_frames = getattr(args, "dynamic_sample_frames", False)
         self.change_rope = getattr(args, "change_rope", False)
         self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
-        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 2)
+        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
         self.multi_caption  = getattr(args, "multi_caption", False)
 
