@@ -3,6 +3,8 @@
 import torch
 import torch.distributed as dist
 from model.base import FrameConcatCausalModel
+import math
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -39,6 +41,10 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.max_context_frames = getattr(args, "max_context_frames", 10)  # for dynamic sample frames
         self.dynamic_sample_frames = getattr(args, "dynamic_sample_frames", False)
         self.change_rope = getattr(args, "change_rope", False)
+        self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
+        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
+        self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
+        self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
 
         self.multi_caption  = getattr(args, "multi_caption", False)
@@ -47,6 +53,121 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         if hasattr(args, 'adapter') and args.adapter is not None:
             self.is_lora_enabled = True
             self.lora_config = args.adapter
+
+    @torch.no_grad()
+    def _encode_shot_query(self, shot_prompt: str, device: torch.device):
+        cond = self.text_encoder(text_prompts=[shot_prompt])
+        query = cond["prompt_embeds"][0].mean(dim=0).to(device)
+        return query
+
+    @torch.no_grad()
+    def _should_use_retrieval(self, prev_query_embed: torch.Tensor, cur_query_embed: torch.Tensor):
+        if prev_query_embed is None or cur_query_embed is None:
+            return True, float("nan")
+        sim = F.cosine_similarity(prev_query_embed, cur_query_embed, dim=0).item()
+        # Two-way routing only:
+        #   high similarity -> fast heuristic context sampling
+        #   low similarity  -> semantic retrieval
+        use_retrieval = sim < self.route_retrieval_cosine_threshold
+        return use_retrieval, sim
+
+    @torch.no_grad()
+    def _build_candidate_entries(self, shot_flags: torch.Tensor, latent_gen_iter: int):
+        candidate_entries = []
+        unique_flags = torch.unique(shot_flags)
+        for shot_flag in unique_flags.tolist():
+            shot_flag = int(shot_flag)
+            if shot_flag >= latent_gen_iter:
+                continue
+            indices = torch.where(shot_flags[0] == shot_flag)[0].tolist()
+            if len(indices) == 0:
+                continue
+            picked = [indices[0]]
+            if self.semantic_memory_frames_per_shot >= 2 and len(indices) > 1:
+                picked.append(indices[1])
+            for idx in picked:
+                candidate_entries.append((idx, shot_flag))
+        return candidate_entries
+
+    def _to_local_context_flags(self, shot_flags_list):
+        """
+        Remap global shot ids to compact local ids for context-only references.
+        """
+        unique_sorted = sorted(set(int(x) for x in shot_flags_list))
+        id_map = {sid: i for i, sid in enumerate(unique_sorted)}
+        return [id_map[int(x)] for x in shot_flags_list]
+
+    @torch.no_grad()
+    def _kv_retrieval_topk_history(
+        self,
+        history_video: torch.Tensor,
+        candidate_entries,
+        query_text: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        if len(candidate_entries) == 0:
+            return None, None
+
+        candidate_indices = [e[0] for e in candidate_entries]
+        candidate_shot_flags = [e[1] for e in candidate_entries]
+        candidate_frames = history_video[candidate_indices]
+        candidate_frames = rearrange(candidate_frames, 'f h w c -> f c 1 h w').to(device).to(dtype)
+        candidate_latents = self.vae.encode_to_latent(candidate_frames).to(device).to(dtype)
+        candidate_latents = rearrange(candidate_latents, 'f 1 c h w -> 1 f c h w')
+
+        batch_size = 1
+        num_candidates = candidate_latents.shape[1]
+        self._initialize_crossattn_cache(batch_size=batch_size, dtype=dtype, device=device)
+        self._initialize_context_kv_cache(
+            batch_size=batch_size,
+            dtype=dtype,
+            device=device,
+            kv_cache_size_override=num_candidates * self.frame_seq_length
+        )
+
+        conditional_dict = self.text_encoder(text_prompts=[query_text])
+        retrieval_timestep = torch.zeros([batch_size, num_candidates], device=device, dtype=torch.int64)
+        # Scheme-1: context-only references use zero shot flags to remove
+        # shot-dependent temporal offset from dynamic RoPE.
+        retrieval_shot_flags = torch.zeros([num_candidates], dtype=torch.int32, device=device)
+        self.generator(
+            noisy_image_or_video=candidate_latents,
+            conditional_dict=conditional_dict,
+            timestep=retrieval_timestep,
+            kv_cache=None,
+            crossattn_cache=self.crossattn_cache,
+            kv_cache_context=self.kv_cache1_context,
+            shot_flags_for_rope=retrieval_shot_flags if self.change_rope else None,
+            current_start=0,
+            use_wo_rope_cache=False,
+        )
+
+        frame_token_count = self.frame_seq_length
+        num_layers = len(self.kv_cache1_context)
+        scores = []
+        for cand_i in range(num_candidates):
+            token_start = cand_i * frame_token_count
+            token_end = token_start + frame_token_count
+            layer_scores = []
+            for layer_i in range(num_layers):
+                q_layer = self.crossattn_cache[layer_i]["k"][0].mean(dim=0)  # [n, d]
+                k_frame = self.kv_cache1_context[layer_i]["k"][0, token_start:token_end]  # [t, n, d]
+                logits = (k_frame * q_layer.unsqueeze(0)).sum(dim=-1) / math.sqrt(q_layer.shape[-1])
+                attn = torch.softmax(logits, dim=0)
+                layer_scores.append((attn * logits).mean())
+            scores.append(torch.stack(layer_scores).mean())
+
+        scores = torch.stack(scores)
+        top_k = min(self.max_context_frames, scores.shape[0])
+        top_ids = torch.topk(scores, k=top_k, dim=0).indices.tolist()
+        selected_indices = [candidate_indices[i] for i in top_ids]
+        selected_shot_flags = [0] * len(selected_indices)
+        if len(selected_indices) < self.max_context_frames and len(selected_indices) > 0:
+            pad_num = self.max_context_frames - len(selected_indices)
+            selected_indices += [selected_indices[-1]] * pad_num
+            selected_shot_flags += [selected_shot_flags[-1]] * pad_num
+        return selected_indices, selected_shot_flags
             
     @torch.no_grad()
     def inference(
@@ -78,11 +199,14 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         # Save generated results
         output_images_list = []
         shot_flags_output = []
+        prev_shot_query_embed = None
 
         for latent_gen_iter in range(len(shot_flags_unique_gt)):
             print(f"shot {latent_gen_iter} begin")
             shot_flags = torch.tensor(shot_flags_output).to(torch.int32) 
             shot_flags_unique = torch.unique(shot_flags)
+            current_shot_query = shots_captions[0][latent_gen_iter][0][0]
+            current_shot_query_embed = self._encode_shot_query(current_shot_query, device)
 
             if self.dynamic_sample_frames:
                 if latent_gen_iter > 0:
@@ -92,48 +216,74 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     counts = [base_count] * shot_number
                     for i in range(1, remainder + 1):
                         counts[-i] += 1
-                elif latent_gen_iter == 0:
+                else:
                     shot_number = 1
                     base_count = self.max_context_frames // shot_number
                     remainder = self.max_context_frames % shot_number
                     counts = [base_count] * shot_number
                     for i in range(1, remainder + 1):
                         counts[-i] += 1
+            else:
+                counts = [self.max_context_frames]
 
             condition_indices = []
             shot_flags_for_rope = []
+            video_data = None
             
             if latent_gen_iter == 0:
                 condition_indices += [0] * counts[0]
                 shot_flags_for_rope += [0] * counts[0]
                 # latent_indices = torch.where(shot_flags_gt[0]==0)
             else:
-                for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
-                    indices = torch.where(shot_flags==shot_flag)
-                    if shot_flag < latent_gen_iter:
-                        if self.dynamic_sample_frames:  # for dynamic sample frames
-                            start_idx = min(indices[0]).item()
-                            end_idx = max(indices[0]).item()
-                            sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
-                            sampled_indices = sampled_steps.round().long().tolist()
-                            condition_indices += sampled_indices
-                            shot_flags_for_rope += [shot_index] * len(sampled_indices)
+                video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
+                video_data = rearrange(video_data, 'f c h w -> f h w c')
+                use_retrieval = self.semantic_retrieval_context
+                if self.route_retrieval_by_prompt_similarity:
+                    use_retrieval, sim = self._should_use_retrieval(
+                        prev_query_embed=prev_shot_query_embed,
+                        cur_query_embed=current_shot_query_embed,
+                    )
+                    print(
+                        f"[Routing] shot={latent_gen_iter}, cosine(prev,cur)={sim:.4f}, "
+                        f"use_retrieval={use_retrieval}, threshold={self.route_retrieval_cosine_threshold}"
+                    )
+                if use_retrieval:
+                    # Retrieval query should come from current-shot prompt only
+                    # (exclude global prompt to avoid retrieval bias).
+                    query_text = current_shot_query
+                    candidate_entries = self._build_candidate_entries(shot_flags, latent_gen_iter)
+                    selected_indices, selected_shot_flags = self._kv_retrieval_topk_history(
+                        history_video=video_data,
+                        candidate_entries=candidate_entries,
+                        query_text=query_text,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    if selected_indices is not None:
+                        condition_indices += selected_indices
+                        shot_flags_for_rope += selected_shot_flags
+                if len(condition_indices) == 0:
+                    for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
+                        indices = torch.where(shot_flags==shot_flag)
+                        if shot_flag < latent_gen_iter:
+                            if self.dynamic_sample_frames:  # for dynamic sample frames
+                                start_idx = min(indices[0]).item()
+                                end_idx = max(indices[0]).item()
+                                sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
+                                sampled_indices = sampled_steps.round().long().tolist()
+                                condition_indices += sampled_indices
+                                shot_flags_for_rope += [shot_index] * len(sampled_indices)
+                            else:
+                                condition_indices.append(min(indices[0]).item())
+                                condition_indices.append(max(indices[0]).item())
                         else:
-                            condition_indices.append(min(indices[0]).item())
-                            condition_indices.append(max(indices[0]).item())
-                    # elif shot_flag == latent_gen_iter:
-                    #     indices = torch.where(shot_flags_gt[0] == shot_flag)
-                    #     latent_indices = indices
-                    else:
-                        break
+                            break
 
             condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=device)
             if latent_gen_iter == 0:
                 # condition_frames = video_data_gt[condition_indices]  # f h w c
                 condition_frames = torch.zeros([self.max_context_frames, 480, 832, 3]).to(device).to(dtype)  # Hard Code for Resolution
             else:
-                video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
-                video_data = rearrange(video_data, 'f c h w -> f h w c')
                 condition_frames = video_data[condition_indices]  # f h w c
 
             if self.dynamic_sample_frames:
@@ -173,7 +323,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             # noise = torch.randn_like(video_latents)  # [1, f, c, h, w]
             noise = torch.randn([1, 21, condition_latents.shape[-3], condition_latents.shape[-2], condition_latents.shape[-1]]).to(device).to(dtype)  # [1, f, c, h, w]
 
-            shot_flags_for_rope += [shot_flags_for_rope[-1]+1] * noise.shape[1]
+            shot_flags_for_rope += [latent_gen_iter] * noise.shape[1]
             shot_flags_for_rope = torch.tensor(shot_flags_for_rope).to(torch.int32).to(device)
 
             batch_size, num_output_frames, num_channels, height, width = noise.shape
@@ -334,6 +484,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
             output_images_list.append(video[0])
             shot_flags_output += [latent_gen_iter] * video.shape[1]
+            prev_shot_query_embed = current_shot_query_embed.detach()
             print(f"shot {latent_gen_iter} end")
 
         video = torch.concat(output_images_list, dim=0)

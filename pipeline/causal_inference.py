@@ -3,6 +3,7 @@
 from typing import List, Optional
 import torch
 import os
+import math
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
@@ -51,6 +52,8 @@ class CausalInferencePipeline(FrameConcatCausalModel):
         self.max_context_frames = getattr(args, "max_context_frames", 10)  # for dynamic sample frames
         self.dynamic_sample_frames = getattr(args, "dynamic_sample_frames", False)
         self.change_rope = getattr(args, "change_rope", False)
+        self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
+        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
         self.multi_caption  = getattr(args, "multi_caption", False)
 
@@ -58,6 +61,108 @@ class CausalInferencePipeline(FrameConcatCausalModel):
         if hasattr(args, 'adapter') and args.adapter is not None:
             self.is_lora_enabled = True
             self.lora_config = args.adapter
+
+    @torch.no_grad()
+    def _build_candidate_entries(self, shot_flags: torch.Tensor):
+        shot_flags_unique = torch.unique(shot_flags)
+        current_shot_flag = int(max(shot_flags_unique).item())
+        candidate_entries = []
+
+        for shot_flag in shot_flags_unique.tolist():
+            shot_flag = int(shot_flag)
+            if shot_flag == current_shot_flag:
+                continue
+            indices = torch.where(shot_flags[0] == shot_flag)[0].tolist()
+            if len(indices) == 0:
+                continue
+            picked = [indices[0]]
+            if self.semantic_memory_frames_per_shot >= 2 and len(indices) > 1:
+                picked.append(indices[1])
+            for idx in picked:
+                candidate_entries.append((idx, shot_flag))
+        return candidate_entries
+
+    def _to_local_context_flags(self, shot_flags_list):
+        """
+        Remap global shot ids to compact local ids for context-only references.
+        """
+        unique_sorted = sorted(set(int(x) for x in shot_flags_list))
+        id_map = {sid: i for i, sid in enumerate(unique_sorted)}
+        return [id_map[int(x)] for x in shot_flags_list]
+
+    @torch.no_grad()
+    def _kv_retrieval_topk_context(
+        self,
+        video_data: torch.Tensor,
+        candidate_entries,
+        query_text: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        if len(candidate_entries) == 0:
+            return None, None
+
+        candidate_indices = [e[0] for e in candidate_entries]
+        candidate_shot_flags = [e[1] for e in candidate_entries]
+        candidate_frames = video_data[candidate_indices]
+        candidate_frames = rearrange(candidate_frames, 'f h w c -> f c 1 h w').to(device).to(dtype)
+        candidate_latents = self.vae.encode_to_latent(candidate_frames).to(device).to(dtype)
+        candidate_latents = rearrange(candidate_latents, 'f 1 c h w -> 1 f c h w')
+
+        batch_size = 1
+        num_candidates = candidate_latents.shape[1]
+        self._initialize_crossattn_cache(batch_size=batch_size, dtype=dtype, device=device)
+        self._initialize_context_kv_cache(
+            batch_size=batch_size,
+            dtype=dtype,
+            device=device,
+            kv_cache_size_override=num_candidates * self.frame_seq_length
+        )
+
+        conditional_dict = self.text_encoder(text_prompts=[query_text])
+        retrieval_timestep = torch.zeros([batch_size, num_candidates], device=device, dtype=torch.int64)
+        # Scheme-1: context-only references use zero shot flags to remove
+        # shot-dependent temporal offset from dynamic RoPE.
+        retrieval_shot_flags = torch.zeros([num_candidates], dtype=torch.int32, device=device)
+        self.generator(
+            noisy_image_or_video=candidate_latents,
+            conditional_dict=conditional_dict,
+            timestep=retrieval_timestep,
+            kv_cache=None,
+            crossattn_cache=self.crossattn_cache,
+            kv_cache_context=self.kv_cache1_context,
+            shot_flags_for_rope=retrieval_shot_flags if self.change_rope else None,
+            current_start=0,
+        )
+
+        frame_token_count = self.frame_seq_length
+        num_layers = len(self.kv_cache1_context)
+        scores = []
+        for cand_i in range(num_candidates):
+            layer_scores = []
+            token_start = cand_i * frame_token_count
+            token_end = token_start + frame_token_count
+            for layer_i in range(num_layers):
+                q_layer = self.crossattn_cache[layer_i]["k"][0].mean(dim=0)  # [n, d]
+                k_frame = self.kv_cache1_context[layer_i]["k"][0, token_start:token_end]  # [t, n, d]
+                logits = (k_frame * q_layer.unsqueeze(0)).sum(dim=-1) / math.sqrt(q_layer.shape[-1])  # [t, n]
+                attn = torch.softmax(logits, dim=0)
+                layer_scores.append((attn * logits).mean())
+            scores.append(torch.stack(layer_scores).mean())
+
+        scores = torch.stack(scores)
+        top_k = min(self.max_context_frames, scores.shape[0])
+        top_ids = torch.topk(scores, k=top_k, dim=0).indices.tolist()
+
+        selected_indices = [candidate_indices[i] for i in top_ids]
+        selected_shot_flags = [0] * len(selected_indices)
+        if len(selected_indices) < self.max_context_frames and len(selected_indices) > 0:
+            pad_num = self.max_context_frames - len(selected_indices)
+            selected_indices += [selected_indices[-1]] * pad_num
+            selected_shot_flags += [selected_shot_flags[-1]] * pad_num
+
+        condition_indices = torch.tensor(selected_indices, dtype=torch.int32, device=video_data.device)
+        return condition_indices, selected_shot_flags
 
     @torch.no_grad()
     def inference(
@@ -95,27 +200,53 @@ class CausalInferencePipeline(FrameConcatCausalModel):
         condition_indices = []
         shot_flags_for_rope = []
 
-        for shot_index, shot_flag in enumerate(shot_flags_unique):
-            indices = torch.where(shot_flags[0]==shot_flag)
-            if shot_flag != max(shot_flags_unique):
-                if self.dynamic_sample_frames:  # for dynamic sample frames
-                    start_idx = min(indices[0]).item()
-                    end_idx = max(indices[0]).item()
-                    sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
-                    sampled_indices = sampled_steps.round().long().tolist()
-                    condition_indices += sampled_indices
-                    shot_flags_for_rope += [shot_index] * len(sampled_indices)
+        if self.semantic_retrieval_context:
+            # Retrieval query should come from current-shot prompt only
+            # (exclude global prompt to avoid retrieval bias).
+            query_text = shots_captions[0][-1][0][0]
+            candidate_entries = self._build_candidate_entries(shot_flags)
+            condition_indices, shot_flags_for_rope = self._kv_retrieval_topk_context(
+                video_data=video_data,
+                candidate_entries=candidate_entries,
+                query_text=query_text,
+                device=self.vae.model.encoder.conv1.weight.device,
+                dtype=self.vae.model.encoder.conv1.weight.dtype,
+            )
+        else:
+            for shot_index, shot_flag in enumerate(shot_flags_unique):
+                indices = torch.where(shot_flags[0] == shot_flag)
+                if shot_flag != max(shot_flags_unique):
+                    if self.dynamic_sample_frames:  # for dynamic sample frames
+                        start_idx = min(indices[0]).item()
+                        end_idx = max(indices[0]).item()
+                        sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
+                        sampled_indices = sampled_steps.round().long().tolist()
+                        condition_indices += sampled_indices
+                        shot_flags_for_rope += [shot_index] * len(sampled_indices)
+                    else:
+                        condition_indices.append(min(indices[0]).item())
+                        condition_indices.append(max(indices[0]).item())
                 else:
+                    latent_indices = indices
+            condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=video_data.device)
+
+        latent_indices = torch.where(shot_flags[0] == max(shot_flags_unique))
+        if condition_indices is None or len(condition_indices) == 0:
+            # Fallback to the original endpoint sampling if semantic retrieval returns nothing.
+            condition_indices = []
+            shot_flags_for_rope = []
+            for shot_flag in shot_flags_unique:
+                indices = torch.where(shot_flags[0] == shot_flag)
+                if shot_flag != max(shot_flags_unique):
                     condition_indices.append(min(indices[0]).item())
                     condition_indices.append(max(indices[0]).item())
-            else:
-                latent_indices = indices
+                    shot_flags_for_rope += [int(shot_flag.item())] * 2
+            condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=video_data.device)
 
-        condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=video_data.device)
         condition_frames = video_data[condition_indices]  # f h w c 
         video_data = video_data[latent_indices[0]]  # f h w c 
 
-        if self.dynamic_sample_frames:
+        if self.dynamic_sample_frames and not self.semantic_retrieval_context:
             assert condition_frames.shape[0] == self.max_context_frames
 
         if self.restrict_max_length is not None:
@@ -152,7 +283,8 @@ class CausalInferencePipeline(FrameConcatCausalModel):
             caption = global_captions[0][0] + shots_captions[0][-1][0][0]
 
         noise = torch.randn_like(video_latents)
-        shot_flags_for_rope += [shot_flags_for_rope[-1]+1] * video_latents.shape[1]
+        current_rope_flag = int(max(shot_flags_unique).item())
+        shot_flags_for_rope += [current_rope_flag] * video_latents.shape[1]
         print(f"[DEBUG] shot_flags for rope is {shot_flags_for_rope}")
         shot_flags_for_rope = torch.tensor(shot_flags_for_rope).to(torch.int32).to(device)
         
