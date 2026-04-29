@@ -82,6 +82,14 @@ class CausalInferencePipeline(FrameConcatCausalModel):
                 candidate_entries.append((idx, shot_flag))
         return candidate_entries
 
+    def _to_local_context_flags(self, shot_flags_list):
+        """
+        Remap global shot ids to compact local ids for context-only references.
+        """
+        unique_sorted = sorted(set(int(x) for x in shot_flags_list))
+        id_map = {sid: i for i, sid in enumerate(unique_sorted)}
+        return [id_map[int(x)] for x in shot_flags_list]
+
     @torch.no_grad()
     def _kv_retrieval_topk_context(
         self,
@@ -113,7 +121,9 @@ class CausalInferencePipeline(FrameConcatCausalModel):
 
         conditional_dict = self.text_encoder(text_prompts=[query_text])
         retrieval_timestep = torch.zeros([batch_size, num_candidates], device=device, dtype=torch.int64)
-        retrieval_shot_flags = torch.tensor(candidate_shot_flags, dtype=torch.int32, device=device)
+        # Scheme-1: context-only references use zero shot flags to remove
+        # shot-dependent temporal offset from dynamic RoPE.
+        retrieval_shot_flags = torch.zeros([num_candidates], dtype=torch.int32, device=device)
         self.generator(
             noisy_image_or_video=candidate_latents,
             conditional_dict=conditional_dict,
@@ -145,7 +155,7 @@ class CausalInferencePipeline(FrameConcatCausalModel):
         top_ids = torch.topk(scores, k=top_k, dim=0).indices.tolist()
 
         selected_indices = [candidate_indices[i] for i in top_ids]
-        selected_shot_flags = [candidate_shot_flags[i] for i in top_ids]
+        selected_shot_flags = [0] * len(selected_indices)
         if len(selected_indices) < self.max_context_frames and len(selected_indices) > 0:
             pad_num = self.max_context_frames - len(selected_indices)
             selected_indices += [selected_indices[-1]] * pad_num
