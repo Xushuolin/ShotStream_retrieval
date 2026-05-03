@@ -43,6 +43,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.change_rope = getattr(args, "change_rope", False)
         self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
         self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
+        self.context_rope_max_id = getattr(args, "context_rope_max_id", 2)
         self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
         self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
@@ -97,6 +98,14 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         id_map = {sid: i for i, sid in enumerate(unique_sorted)}
         return [id_map[int(x)] for x in shot_flags_list]
 
+    def _to_small_context_flags(self, shot_flags_list):
+        """
+        Map context shot ids to a small seen-like range for RoPE stability.
+        """
+        local_flags = self._to_local_context_flags(shot_flags_list)
+        max_id = max(0, int(self.context_rope_max_id))
+        return [min(int(v), max_id) for v in local_flags]
+
     @torch.no_grad()
     def _kv_retrieval_topk_history(
         self,
@@ -128,9 +137,9 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
 
         conditional_dict = self.text_encoder(text_prompts=[query_text])
         retrieval_timestep = torch.zeros([batch_size, num_candidates], device=device, dtype=torch.int64)
-        # Scheme-1: context-only references use zero shot flags to remove
-        # shot-dependent temporal offset from dynamic RoPE.
-        retrieval_shot_flags = torch.zeros([num_candidates], dtype=torch.int32, device=device)
+        retrieval_shot_flags = torch.tensor(
+            self._to_small_context_flags(candidate_shot_flags), dtype=torch.int32, device=device
+        )
         self.generator(
             noisy_image_or_video=candidate_latents,
             conditional_dict=conditional_dict,
@@ -162,7 +171,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         top_k = min(self.max_context_frames, scores.shape[0])
         top_ids = torch.topk(scores, k=top_k, dim=0).indices.tolist()
         selected_indices = [candidate_indices[i] for i in top_ids]
-        selected_shot_flags = [0] * len(selected_indices)
+        selected_shot_flags = [candidate_shot_flags[i] for i in top_ids]
+        selected_shot_flags = self._to_small_context_flags(selected_shot_flags)
         if len(selected_indices) < self.max_context_frames and len(selected_indices) > 0:
             pad_num = self.max_context_frames - len(selected_indices)
             selected_indices += [selected_indices[-1]] * pad_num
