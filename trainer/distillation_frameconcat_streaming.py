@@ -684,7 +684,12 @@ class Trainer:
         else:
             caption = global_captions[0][0] + shots_captions[0][0][-1][0]
 
-        shot_flags_for_rope += [shot_flags_for_rope[-1]+1] * video_latents.shape[1]
+        num_rope_latent_frames = max(
+            video_latents.shape[1],
+            int(getattr(self.model, "num_training_frames", getattr(self.config, "num_training_frames", video_latents.shape[1])))
+        )
+        current_rope_flag = (max(shot_flags_for_rope) + 1) if len(shot_flags_for_rope) > 0 else 0
+        shot_flags_for_rope += [current_rope_flag] * num_rope_latent_frames
 
         # Step 2: Extract the conditional infos
         with torch.no_grad():
