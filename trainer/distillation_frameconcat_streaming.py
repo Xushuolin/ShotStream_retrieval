@@ -598,6 +598,7 @@ class Trainer:
         shot_flags = torch.tensor(shot_flags_output).to(torch.int32) 
         shot_flags_unique = torch.unique(shot_flags)
 
+        counts = [self.max_context_frames]
         if self.dynamic_sample_frames:
             if latent_gen_iter > 0:
                 shot_number = shot_flags_unique.shape[0]  # except the noise latent 
@@ -619,11 +620,15 @@ class Trainer:
         condition_indices = []
         shot_flags_for_rope = []
         condition_indices_gt = []  # for gt context
+        latent_indices = torch.where(shot_flags_gt[0] == latent_gen_iter)
+        if latent_indices[0].numel() == 0:
+            # Fallback: use the latest available shot in GT flags to avoid unset latent target.
+            fallback_shot = int(torch.max(shot_flags_gt[0]).item())
+            latent_indices = torch.where(shot_flags_gt[0] == fallback_shot)
 
         if latent_gen_iter == 0:
             condition_indices += [0] * counts[0]
             shot_flags_for_rope += [0] * counts[0]
-            latent_indices = torch.where(shot_flags_gt[0]==0)
             if self.real_fake_use_gt_context:
                 condition_indices_gt += [0] * counts[0]
         else:

@@ -44,6 +44,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
         self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
         self.context_rope_max_id = getattr(args, "context_rope_max_id", 2)
+        self.max_refers_ratio = float(getattr(args, "max_refers_ratio", 0.5))
+        self.refers_fixed_rope_id = getattr(args, "refers_fixed_rope_id", None)
         self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
         self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
@@ -105,6 +107,24 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         local_flags = self._to_local_context_flags(shot_flags_list)
         max_id = max(0, int(self.context_rope_max_id))
         return [min(int(v), max_id) for v in local_flags]
+
+    def _parse_refers_for_shot(self, refers_meta, latent_gen_iter: int, history_length: int):
+        if refers_meta is None:
+            return []
+        valid = []
+        for item in refers_meta:
+            if not isinstance(item, dict):
+                continue
+            target_shot = item.get("shot", "all")
+            if target_shot != "all" and int(target_shot) != int(latent_gen_iter):
+                continue
+            idx = item.get("history_frame_idx", item.get("frame_idx", None))
+            if idx is None:
+                continue
+            idx = int(idx)
+            if 0 <= idx < history_length:
+                valid.append(idx)
+        return valid
 
     @torch.no_grad()
     def _kv_retrieval_topk_history(
@@ -205,6 +225,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         shots_captions = batch['shots_captions']
         shot_flags_gt = torch.tensor([batch['shot_flag']]).to(torch.int32) 
         shot_flags_unique_gt = torch.unique(shot_flags_gt)
+        refers_meta = batch.get('refers', [[]])[0]
 
         # Save generated results
         output_images_list = []
@@ -247,6 +268,14 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             else:
                 video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
                 video_data = rearrange(video_data, 'f c h w -> f h w c')
+                max_refers = min(int(self.max_context_frames * self.max_refers_ratio), self.max_context_frames // 2)
+                refers_indices = self._parse_refers_for_shot(
+                    refers_meta=refers_meta,
+                    latent_gen_iter=latent_gen_iter,
+                    history_length=video_data.shape[0]
+                )[:max_refers]
+                remaining_context = max(0, self.max_context_frames - len(refers_indices))
+
                 use_retrieval = self.semantic_retrieval_context
                 if self.route_retrieval_by_prompt_similarity:
                     use_retrieval, sim = self._should_use_retrieval(
@@ -270,8 +299,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                         dtype=dtype,
                     )
                     if selected_indices is not None:
-                        condition_indices += selected_indices
-                        shot_flags_for_rope += selected_shot_flags
+                        condition_indices += selected_indices[:remaining_context]
+                        shot_flags_for_rope += selected_shot_flags[:remaining_context]
                 if len(condition_indices) == 0:
                     for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
                         indices = torch.where(shot_flags==shot_flag)
@@ -286,8 +315,17 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                             else:
                                 condition_indices.append(min(indices[0]).item())
                                 condition_indices.append(max(indices[0]).item())
-                        else:
-                            break
+
+                if len(refers_indices) > 0:
+                    refers_flag = self.refers_fixed_rope_id
+                    if refers_flag is None:
+                        refers_flag = int(self.context_rope_max_id)
+                    refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id)))
+                    condition_indices = refers_indices + condition_indices
+                    shot_flags_for_rope = [refers_flag] * len(refers_indices) + shot_flags_for_rope
+
+                condition_indices = condition_indices[:self.max_context_frames]
+                shot_flags_for_rope = shot_flags_for_rope[:self.max_context_frames]
 
             condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=device)
             if latent_gen_iter == 0:
