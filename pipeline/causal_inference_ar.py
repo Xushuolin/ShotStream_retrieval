@@ -78,6 +78,35 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         use_retrieval = sim < self.route_retrieval_cosine_threshold
         return use_retrieval, sim
 
+
+    def _scalar_ref_value(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.tolist()
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            return self._scalar_ref_value(value[0])
+        return value
+
+    def _normalize_refers_meta(self, refers_meta):
+        if refers_meta is None:
+            return []
+        if isinstance(refers_meta, tuple):
+            refers_meta = list(refers_meta)
+        if isinstance(refers_meta, dict):
+            return [{key: self._scalar_ref_value(value) for key, value in refers_meta.items()}]
+        if isinstance(refers_meta, list):
+            if len(refers_meta) == 1 and isinstance(refers_meta[0], list):
+                return refers_meta[0]
+            normalized = []
+            for item in refers_meta:
+                if isinstance(item, dict):
+                    normalized.append({key: self._scalar_ref_value(value) for key, value in item.items()})
+                elif isinstance(item, list):
+                    normalized.extend(item)
+            return normalized
+        return []
+
     @torch.no_grad()
     def _build_candidate_entries(self, shot_flags: torch.Tensor, latent_gen_iter: int):
         candidate_entries = []
@@ -268,7 +297,9 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         shots_captions = batch['shots_captions']
         shot_flags_gt = torch.tensor([batch['shot_flag']]).to(torch.int32) 
         shot_flags_unique_gt = torch.unique(shot_flags_gt)
-        refers_meta = batch.get('refers', [[]])[0]
+        refers_meta = self._normalize_refers_meta(batch.get('refers', []))
+        if refers_meta:
+            print(f"[Refers] loaded {len(refers_meta)} refer item(s) from batch")
 
         # Save generated results
         output_images_list = []
