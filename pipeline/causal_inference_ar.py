@@ -412,7 +412,11 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     refers_flag = self.refers_fixed_rope_id
                     if refers_flag is None:
                         refers_flag = int(self.context_rope_max_id)
-                    refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id)))
+                    # The same flag tensor is also used to select the per-shot text context
+                    # in cross-attention (k = k[shot_flags_for_rope]). Keep refer flags
+                    # within the currently available prompt indices to avoid OOB gathers.
+                    max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                    refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id), max_prompt_flag))
                     condition_frames = torch.cat([refer_frames, memory_frames], dim=0)
                     shot_flags_for_rope = [refers_flag] * refer_frames.shape[0] + shot_flags_for_rope
                 else:
