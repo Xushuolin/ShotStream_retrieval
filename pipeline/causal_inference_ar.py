@@ -50,6 +50,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.context_rope_max_id = getattr(args, "context_rope_max_id", 2)
         self.max_refers_ratio = float(getattr(args, "max_refers_ratio", 0.5))
         self.refers_fixed_rope_id = getattr(args, "refers_fixed_rope_id", None)
+        self.debug_refers_context = getattr(args, "debug_refers_context", True)
         self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
         self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
@@ -184,19 +185,22 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
 
     def _build_refer_frames(self, refer_entries, history_video: torch.Tensor, device: torch.device, dtype: torch.dtype):
         if len(refer_entries) == 0:
-            return None
+            return None, []
         height, width = history_video.shape[1], history_video.shape[2]
         frames = []
+        sources = []
         for refer_type, value in refer_entries:
             if refer_type == "history":
                 frames.append(history_video[int(value)].to(device=device, dtype=dtype))
+                sources.append(f"refer:history:{int(value)}")
             elif refer_type == "image":
                 frame = self._load_refer_image(str(value), height, width, device, dtype)
                 if frame is not None:
                     frames.append(frame)
+                    sources.append(f"refer:image:{value}")
         if len(frames) == 0:
-            return None
-        return torch.stack(frames, dim=0)
+            return None, []
+        return torch.stack(frames, dim=0), sources
 
     @torch.no_grad()
     def _kv_retrieval_topk_history(
@@ -348,7 +352,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     latent_gen_iter=latent_gen_iter,
                     history_length=video_data.shape[0]
                 )[:max_refers]
-                refer_frames = self._build_refer_frames(
+                refer_frames, refer_sources = self._build_refer_frames(
                     refer_entries=refer_entries,
                     history_video=video_data,
                     device=device,
@@ -382,8 +386,10 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                         dtype=dtype,
                     )
                     if selected_indices is not None:
-                        condition_indices += selected_indices[:remaining_context]
-                        shot_flags_for_rope += selected_shot_flags[:remaining_context]
+                        selected_indices = selected_indices[:remaining_context]
+                        selected_shot_flags = selected_shot_flags[:remaining_context]
+                        condition_indices += selected_indices
+                        shot_flags_for_rope += selected_shot_flags
                 if len(condition_indices) == 0:
                     for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
                         indices = torch.where(shot_flags==shot_flag)
@@ -407,6 +413,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 # condition_frames = video_data_gt[condition_indices]  # f h w c
                 condition_frames = torch.zeros([self.max_context_frames, 480, 832, 3]).to(device).to(dtype)  # Hard Code for Resolution
             else:
+                memory_indices_for_log = condition_indices.detach().cpu().tolist() if condition_indices.numel() > 0 else []
                 memory_frames = video_data[condition_indices] if condition_indices.numel() > 0 else video_data[:0]
                 if refer_frames is not None:
                     refers_flag = self.refers_fixed_rope_id
@@ -428,6 +435,16 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     shot_flags_for_rope += [shot_flags_for_rope[-1]] * pad_num
                 condition_frames = condition_frames[:self.max_context_frames]
                 shot_flags_for_rope = shot_flags_for_rope[:self.max_context_frames]
+                if self.debug_refers_context:
+                    memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(refer_sources if refer_frames is not None else []))]
+                    context_sources = (refer_sources if refer_frames is not None else []) + memory_sources
+                    print(
+                        f"[Context] shot={latent_gen_iter + 1}, "
+                        f"refer_slots={0 if refer_frames is None else refer_frames.shape[0]}, "
+                        f"memory_slots={len(memory_sources)}, "
+                        f"final_frames={condition_frames.shape[0]}, "
+                        f"sources={context_sources}, flags={shot_flags_for_rope}"
+                    )
 
             if self.dynamic_sample_frames:
                 assert condition_frames.shape[0] == self.max_context_frames
