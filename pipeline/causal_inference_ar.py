@@ -337,11 +337,13 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
 
             condition_indices = []
             shot_flags_for_rope = []
+            text_context_indices = []
             video_data = None
             
             if latent_gen_iter == 0:
                 condition_indices += [0] * counts[0]
                 shot_flags_for_rope += [0] * counts[0]
+                text_context_indices += [0] * counts[0]
                 # latent_indices = torch.where(shot_flags_gt[0]==0)
             else:
                 video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
@@ -390,6 +392,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                         selected_shot_flags = selected_shot_flags[:remaining_context]
                         condition_indices += selected_indices
                         shot_flags_for_rope += selected_shot_flags
+                        max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                        text_context_indices += [max(0, min(int(flag), max_prompt_flag)) for flag in selected_shot_flags]
                 if len(condition_indices) == 0:
                     for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
                         indices = torch.where(shot_flags==shot_flag)
@@ -401,12 +405,18 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                                 sampled_indices = sampled_steps.round().long().tolist()
                                 condition_indices += sampled_indices
                                 shot_flags_for_rope += [shot_index] * len(sampled_indices)
+                                max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                                text_context_indices += [max(0, min(int(shot_index), max_prompt_flag))] * len(sampled_indices)
                             else:
                                 condition_indices.append(min(indices[0]).item())
                                 condition_indices.append(max(indices[0]).item())
+                                shot_flags_for_rope += [shot_index, shot_index]
+                                max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                                text_context_indices += [max(0, min(int(shot_index), max_prompt_flag))] * 2
 
                 condition_indices = condition_indices[:remaining_context]
                 shot_flags_for_rope = shot_flags_for_rope[:remaining_context]
+                text_context_indices = text_context_indices[:remaining_context]
 
             condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=device)
             if latent_gen_iter == 0:
@@ -419,13 +429,15 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     refers_flag = self.refers_fixed_rope_id
                     if refers_flag is None:
                         refers_flag = int(self.context_rope_max_id)
-                    # The same flag tensor is also used to select the per-shot text context
-                    # in cross-attention (k = k[shot_flags_for_rope]). Keep refer flags
-                    # within the currently available prompt indices to avoid OOB gathers.
-                    max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
-                    refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id), max_prompt_flag))
+                    # Scheme B: split RoPE routing from text-context routing.
+                    # Refer frames get a compact RoPE id for positional stability, but
+                    # attend to the current shot prompt so the external image guides the
+                    # shot being generated instead of an older prompt bucket.
+                    refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id)))
+                    refer_text_index = int(latent_gen_iter) if self.multi_caption else 0
                     condition_frames = torch.cat([refer_frames, memory_frames], dim=0)
                     shot_flags_for_rope = [refers_flag] * refer_frames.shape[0] + shot_flags_for_rope
+                    text_context_indices = [refer_text_index] * refer_frames.shape[0] + text_context_indices
                 else:
                     condition_frames = memory_frames
 
@@ -433,8 +445,10 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     pad_num = self.max_context_frames - condition_frames.shape[0]
                     condition_frames = torch.cat([condition_frames, condition_frames[-1:].repeat(pad_num, 1, 1, 1)], dim=0)
                     shot_flags_for_rope += [shot_flags_for_rope[-1]] * pad_num
+                    text_context_indices += [text_context_indices[-1]] * pad_num
                 condition_frames = condition_frames[:self.max_context_frames]
                 shot_flags_for_rope = shot_flags_for_rope[:self.max_context_frames]
+                text_context_indices = text_context_indices[:self.max_context_frames]
                 if self.debug_refers_context:
                     memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(refer_sources if refer_frames is not None else []))]
                     context_sources = (refer_sources if refer_frames is not None else []) + memory_sources
@@ -443,7 +457,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                         f"refer_slots={0 if refer_frames is None else refer_frames.shape[0]}, "
                         f"memory_slots={len(memory_sources)}, "
                         f"final_frames={condition_frames.shape[0]}, "
-                        f"sources={context_sources}, flags={shot_flags_for_rope}"
+                        f"sources={context_sources}, rope_flags={shot_flags_for_rope}, "
+                        f"text_indices={text_context_indices}"
                     )
 
             if self.dynamic_sample_frames:
@@ -484,7 +499,9 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             noise = torch.randn([1, 21, condition_latents.shape[-3], condition_latents.shape[-2], condition_latents.shape[-1]]).to(device).to(dtype)  # [1, f, c, h, w]
 
             shot_flags_for_rope += [latent_gen_iter] * noise.shape[1]
+            text_context_indices += [latent_gen_iter if self.multi_caption else 0] * noise.shape[1]
             shot_flags_for_rope = torch.tensor(shot_flags_for_rope).to(torch.int32).to(device)
+            text_context_indices = torch.tensor(text_context_indices).to(torch.int32).to(device)
 
             batch_size, num_output_frames, num_channels, height, width = noise.shape
             
@@ -560,6 +577,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 ###
                 kv_cache_context=self.kv_cache1_context,
                 shot_flags_for_rope = shot_flags_for_rope[:condition_latents.shape[1]] if self.change_rope else None,
+                text_context_indices = text_context_indices[:condition_latents.shape[1]] if self.multi_caption else None,
                 ###
                 current_start=0,
             )
@@ -589,6 +607,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                             ###
                             kv_cache_context=self.kv_cache1_context,
                             shot_flags_for_rope = shot_flags_for_rope[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]]  if self.change_rope else None,
+                            text_context_indices = text_context_indices[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.multi_caption else None,
                             use_wo_rope_cache=use_wo_rope_cache,
                             ###
                             crossattn_cache=self.crossattn_cache,
@@ -611,6 +630,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                             ###
                             kv_cache_context=self.kv_cache1_context,
                             shot_flags_for_rope = shot_flags_for_rope[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.change_rope else None,
+                            text_context_indices = text_context_indices[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.multi_caption else None,
                             use_wo_rope_cache=use_wo_rope_cache,
                             ###
                             crossattn_cache=self.crossattn_cache,
@@ -630,6 +650,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     ###
                     kv_cache_context=self.kv_cache1_context,
                     shot_flags_for_rope = shot_flags_for_rope[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.change_rope else None,
+                    text_context_indices = text_context_indices[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.multi_caption else None,
                     use_wo_rope_cache=use_wo_rope_cache,
                     ###
                 )

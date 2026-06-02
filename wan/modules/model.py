@@ -205,7 +205,16 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None, grid_sizes=None, shot_flags_for_rope=None):
+    def forward(
+        self,
+        x,
+        context,
+        context_lens,
+        crossattn_cache=None,
+        grid_sizes=None,
+        shot_flags_for_rope=None,
+        text_context_indices=None,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -274,9 +283,29 @@ class WanT2VCrossAttention(WanSelfAttention):
             v: [b, 512, head, dim]
 
             '''
-            # if grid_sizes is not None:
-            k = k[shot_flags_for_rope]
-            v = v[shot_flags_for_rope]
+            # Cross-attention text routing can differ from dynamic-RoPE routing.
+            # `shot_flags_for_rope` remains the fallback for backward compatibility,
+            # while `text_context_indices` explicitly selects which prompt context each
+            # visual frame should attend to. This lets external refer frames use a
+            # RoPE-safe small id without accidentally attending to the wrong shot text.
+            context_indices = text_context_indices if text_context_indices is not None else shot_flags_for_rope
+            if context_indices is None:
+                context_indices = torch.zeros(q.shape[0], device=k.device, dtype=torch.long)
+            else:
+                context_indices = context_indices.to(device=k.device, dtype=torch.long).flatten().clone()
+                if context_indices.numel() == 1 and q.shape[0] > 1:
+                    context_indices = context_indices.repeat(q.shape[0])
+                elif context_indices.numel() < q.shape[0]:
+                    pad_value = context_indices[-1] if context_indices.numel() > 0 else torch.tensor(0, device=k.device)
+                    context_indices = torch.cat([
+                        context_indices,
+                        pad_value.repeat(q.shape[0] - context_indices.numel())
+                    ])
+                elif context_indices.numel() > q.shape[0]:
+                    context_indices = context_indices[:q.shape[0]]
+            context_indices = context_indices.clamp_(0, context.shape[0] - 1)
+            k = k[context_indices]
+            v = v[context_indices]
             x = flash_attention(q, k, v, k_lens=context_lens)
             x = x.view(b, -1, n, d)
 
@@ -414,6 +443,7 @@ class WanAttentionBlock(nn.Module):
         context_lens,
         freqs_dynamic=None,
         shot_flags_for_rope=None,
+        text_context_indices=None,
     ):
         r"""
         Args:
@@ -441,14 +471,21 @@ class WanAttentionBlock(nn.Module):
         x = x + y * e[2]
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, grid_sizes=None, shot_flags_for_rope=None):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens, grid_sizes=grid_sizes, shot_flags_for_rope=shot_flags_for_rope)
+        def cross_attn_ffn(x, context, context_lens, e, grid_sizes=None, shot_flags_for_rope=None, text_context_indices=None):
+            x = x + self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                grid_sizes=grid_sizes,
+                shot_flags_for_rope=shot_flags_for_rope,
+                text_context_indices=text_context_indices,
+            )
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             # with amp.autocast(dtype=torch.float32):
             x = x + y * e[5]
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, grid_sizes, shot_flags_for_rope)
+        x = cross_attn_ffn(x, context, context_lens, e, grid_sizes, shot_flags_for_rope, text_context_indices)
         return x
 
 
@@ -748,6 +785,7 @@ class WanModel(ModelMixin, ConfigMixin):
         y=None,
         ###
         shot_flags_for_rope=None,
+        text_context_indices=None,
         ###
     ):
         r"""
@@ -838,7 +876,8 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             freqs_dynamic=self.freqs_dynamic,
-            shot_flags_for_rope=shot_flags_for_rope,)
+            shot_flags_for_rope=shot_flags_for_rope,
+            text_context_indices=text_context_indices,)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
