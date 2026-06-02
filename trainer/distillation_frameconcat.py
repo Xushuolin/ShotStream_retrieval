@@ -14,6 +14,7 @@ import torch.distributed as dist
 from model import DMDFrameConcat
 from model.streaming_training import StreamingTrainingModel
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter # MODIFIED: Added TensorBoard
 import time
 import os
@@ -70,6 +71,9 @@ class Trainer:
         self.train_lora = getattr(config, "train_lora", False)
         self.train_lora_generator = getattr(config, "train_lora_generator", False)
         self.multi_caption = getattr(config, "multi_caption", False)  # for multi caption
+        self.semantic_retrieval_context = getattr(config, "semantic_retrieval_context", False)
+        self.semantic_memory_frames_per_shot = getattr(config, "semantic_memory_frames_per_shot", 1)
+        self.context_rope_max_id = getattr(config, "context_rope_max_id", 2)
 
         self.train_lora_fake = getattr(config, "train_lora_fake", False)
         print(f"self.train_lora_fake is {self.train_lora_fake}")
@@ -433,6 +437,57 @@ class Trainer:
         return switch_idx
 
 
+
+    def _shot_prompt(self, global_captions, shots_captions, shot_index: int, include_global: bool = False):
+        shot_prompt = shots_captions[0][0][shot_index][0]
+        if include_global:
+            return global_captions[0][0] + shot_prompt
+        return shot_prompt
+
+    def _to_local_context_flags(self, shot_flags_list):
+        unique_sorted = sorted(set(int(x) for x in shot_flags_list))
+        id_map = {sid: i for i, sid in enumerate(unique_sorted)}
+        return [id_map[int(x)] for x in shot_flags_list]
+
+    def _to_small_context_flags(self, shot_flags_list):
+        local_flags = self._to_local_context_flags(shot_flags_list)
+        max_id = max(0, int(self.context_rope_max_id))
+        return [min(int(v), max_id) for v in local_flags]
+
+    @torch.no_grad()
+    def _select_semantic_context_indices(self, shot_flags, shot_flags_unique, global_captions, shots_captions):
+        current_shot_index = len(shot_flags_unique) - 1
+        candidate_entries = []
+        for shot_index, shot_flag in enumerate(shot_flags_unique):
+            if shot_flag == max(shot_flags_unique):
+                continue
+            indices = torch.where(shot_flags[0][0] == shot_flag)[0].tolist()
+            for idx in indices[:self.semantic_memory_frames_per_shot]:
+                candidate_entries.append((idx, shot_index))
+
+        if len(candidate_entries) == 0:
+            return None, None
+
+        query_prompt = self._shot_prompt(global_captions, shots_captions, current_shot_index, include_global=False)
+        memory_prompts = [
+            self._shot_prompt(global_captions, shots_captions, shot_index, include_global=False)
+            for _, shot_index in candidate_entries
+        ]
+        prompt_embeds = self.model.text_encoder(text_prompts=[query_prompt] + memory_prompts)["prompt_embeds"].float()
+        prompt_embeds = F.normalize(prompt_embeds.mean(dim=1), dim=-1)
+        scores = prompt_embeds[1:] @ prompt_embeds[0]
+        top_k = min(self.max_context_frames, scores.shape[0])
+        top_ids = torch.topk(scores, k=top_k, dim=0).indices.tolist()
+
+        selected_indices = [candidate_entries[i][0] for i in top_ids]
+        selected_flags = [candidate_entries[i][1] for i in top_ids]
+        selected_flags = self._to_small_context_flags(selected_flags)
+        if len(selected_indices) < self.max_context_frames and len(selected_indices) > 0:
+            pad_num = self.max_context_frames - len(selected_indices)
+            selected_indices += [selected_indices[-1]] * pad_num
+            selected_flags += [selected_flags[-1]] * pad_num
+        return selected_indices, selected_flags
+
     def save(self):
         print("Start gathering distributed model states...")
 
@@ -550,22 +605,34 @@ class Trainer:
 
         condition_indices = []
         shot_flags_for_rope = []
+        latent_indices = torch.where(shot_flags[0][0] == max(shot_flags_unique))
 
-        for shot_index, shot_flag in enumerate(shot_flags_unique):
-            indices = torch.where(shot_flags[0][0]==shot_flag)
-            if shot_flag != max(shot_flags_unique):
-                if self.dynamic_sample_frames:  # for dynamic sample frames
-                    start_idx = min(indices[0]).item()
-                    end_idx = max(indices[0]).item()
-                    sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
-                    sampled_indices = sampled_steps.round().long().tolist()
-                    condition_indices += sampled_indices
-                    shot_flags_for_rope += [shot_index] * len(sampled_indices)
-                else:
-                    condition_indices.append(min(indices[0]).item())
-                    condition_indices.append(max(indices[0]).item())
-            else:
-                latent_indices = indices
+        if self.semantic_retrieval_context:
+            selected_indices, selected_flags = self._select_semantic_context_indices(
+                shot_flags=shot_flags,
+                shot_flags_unique=shot_flags_unique,
+                global_captions=global_captions,
+                shots_captions=shots_captions,
+            )
+            if selected_indices is not None:
+                condition_indices += selected_indices
+                shot_flags_for_rope += selected_flags
+
+        if len(condition_indices) == 0:
+            for shot_index, shot_flag in enumerate(shot_flags_unique):
+                indices = torch.where(shot_flags[0][0]==shot_flag)
+                if shot_flag != max(shot_flags_unique):
+                    if self.dynamic_sample_frames:  # for dynamic sample frames
+                        start_idx = min(indices[0]).item()
+                        end_idx = max(indices[0]).item()
+                        sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
+                        sampled_indices = sampled_steps.round().long().tolist()
+                        condition_indices += sampled_indices
+                        shot_flags_for_rope += [shot_index] * len(sampled_indices)
+                    else:
+                        condition_indices.append(min(indices[0]).item())
+                        condition_indices.append(max(indices[0]).item())
+
         condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=video_data.device)
         condition_frames = video_data[condition_indices]  # f h w c 
         if self.dynamic_sample_frames:
@@ -610,7 +677,12 @@ class Trainer:
         else:
             caption = global_captions[0][0] + shots_captions[0][0][-1][0]
 
-        shot_flags_for_rope += [shot_flags_for_rope[-1]+1] * video_latents.shape[1]
+        num_rope_latent_frames = max(
+            video_latents.shape[1],
+            int(getattr(self.model, "num_training_frames", getattr(self.config, "num_training_frames", video_latents.shape[1])))
+        )
+        current_rope_flag = (max(shot_flags_for_rope) + 1) if len(shot_flags_for_rope) > 0 else 0
+        shot_flags_for_rope += [current_rope_flag] * num_rope_latent_frames
 
         # Step 2: Extract the conditional infos
         with torch.no_grad():
