@@ -50,6 +50,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.context_rope_max_id = getattr(args, "context_rope_max_id", 2)
         self.max_refers_ratio = float(getattr(args, "max_refers_ratio", 0.5))
         self.refers_fixed_rope_id = getattr(args, "refers_fixed_rope_id", None)
+        self.refer_fill_context = getattr(args, "refer_fill_context", False)
+        self.refer_fill_context_mode = getattr(args, "refer_fill_context_mode", "cycle")
         self.debug_refers_context = getattr(args, "debug_refers_context", True)
         self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
         self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
@@ -425,6 +427,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             else:
                 memory_indices_for_log = condition_indices.detach().cpu().tolist() if condition_indices.numel() > 0 else []
                 memory_frames = video_data[condition_indices] if condition_indices.numel() > 0 else video_data[:0]
+                fill_sources = None
                 if refer_frames is not None:
                     refers_flag = self.refers_fixed_rope_id
                     if refers_flag is None:
@@ -435,9 +438,27 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     # shot being generated instead of an older prompt bucket.
                     refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id)))
                     refer_text_index = int(latent_gen_iter) if self.multi_caption else 0
-                    condition_frames = torch.cat([refer_frames, memory_frames], dim=0)
-                    shot_flags_for_rope = [refers_flag] * refer_frames.shape[0] + shot_flags_for_rope
-                    text_context_indices = [refer_text_index] * refer_frames.shape[0] + text_context_indices
+                    if self.refer_fill_context:
+                        # Experiment 1: diagnose whether the global context-KV route can
+                        # carry an external reference at all by replacing every context
+                        # slot with refer frame(s), after retrieval/sampling has run.
+                        if self.refer_fill_context_mode == "repeat_first":
+                            fill_indices = [0] * self.max_context_frames
+                        else:
+                            fill_indices = [i % refer_frames.shape[0] for i in range(self.max_context_frames)]
+                        fill_index_tensor = torch.tensor(fill_indices, dtype=torch.long, device=refer_frames.device)
+                        condition_frames = refer_frames.index_select(0, fill_index_tensor)
+                        shot_flags_for_rope = [refers_flag] * self.max_context_frames
+                        text_context_indices = [refer_text_index] * self.max_context_frames
+                        fill_sources = [refer_sources[i] for i in fill_indices]
+                        print(
+                            f"[Refers] shot={latent_gen_iter + 1}, fill all {self.max_context_frames} "
+                            f"context slot(s) with reference frame(s), mode={self.refer_fill_context_mode}"
+                        )
+                    else:
+                        condition_frames = torch.cat([refer_frames, memory_frames], dim=0)
+                        shot_flags_for_rope = [refers_flag] * refer_frames.shape[0] + shot_flags_for_rope
+                        text_context_indices = [refer_text_index] * refer_frames.shape[0] + text_context_indices
                 else:
                     condition_frames = memory_frames
 
@@ -450,13 +471,18 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 shot_flags_for_rope = shot_flags_for_rope[:self.max_context_frames]
                 text_context_indices = text_context_indices[:self.max_context_frames]
                 if self.debug_refers_context:
-                    memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(refer_sources if refer_frames is not None else []))]
-                    context_sources = (refer_sources if refer_frames is not None else []) + memory_sources
+                    if fill_sources is not None:
+                        memory_sources = []
+                        context_sources = fill_sources
+                    else:
+                        memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(refer_sources if refer_frames is not None else []))]
+                        context_sources = (refer_sources if refer_frames is not None else []) + memory_sources
                     print(
                         f"[Context] shot={latent_gen_iter + 1}, "
                         f"refer_slots={0 if refer_frames is None else refer_frames.shape[0]}, "
                         f"memory_slots={len(memory_sources)}, "
                         f"final_frames={condition_frames.shape[0]}, "
+                        f"refer_fill_context={self.refer_fill_context}, "
                         f"sources={context_sources}, rope_flags={shot_flags_for_rope}, "
                         f"text_indices={text_context_indices}"
                     )
