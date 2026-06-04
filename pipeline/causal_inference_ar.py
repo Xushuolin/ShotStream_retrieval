@@ -3,6 +3,12 @@
 import torch
 import torch.distributed as dist
 from model.base import FrameConcatCausalModel
+import math
+import os
+
+import numpy as np
+import torch.nn.functional as F
+from PIL import Image
 
 from einops import rearrange
 
@@ -39,6 +45,16 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.max_context_frames = getattr(args, "max_context_frames", 10)  # for dynamic sample frames
         self.dynamic_sample_frames = getattr(args, "dynamic_sample_frames", False)
         self.change_rope = getattr(args, "change_rope", False)
+        self.semantic_retrieval_context = getattr(args, "semantic_retrieval_context", True)
+        self.semantic_memory_frames_per_shot = getattr(args, "semantic_memory_frames_per_shot", 1)
+        self.context_rope_max_id = getattr(args, "context_rope_max_id", 2)
+        self.max_refers_ratio = float(getattr(args, "max_refers_ratio", 0.5))
+        self.refers_fixed_rope_id = getattr(args, "refers_fixed_rope_id", None)
+        self.refer_fill_context = getattr(args, "refer_fill_context", False)
+        self.refer_fill_context_mode = getattr(args, "refer_fill_context_mode", "cycle")
+        self.debug_refers_context = getattr(args, "debug_refers_context", True)
+        self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
+        self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
         self.restrict_max_length  = getattr(args, "restrict_max_length", 81)
 
         self.multi_caption  = getattr(args, "multi_caption", False)
@@ -47,6 +63,219 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         if hasattr(args, 'adapter') and args.adapter is not None:
             self.is_lora_enabled = True
             self.lora_config = args.adapter
+
+    @torch.no_grad()
+    def _encode_shot_query(self, shot_prompt: str, device: torch.device):
+        cond = self.text_encoder(text_prompts=[shot_prompt])
+        query = cond["prompt_embeds"][0].mean(dim=0).to(device)
+        return query
+
+    @torch.no_grad()
+    def _should_use_retrieval(self, prev_query_embed: torch.Tensor, cur_query_embed: torch.Tensor):
+        if prev_query_embed is None or cur_query_embed is None:
+            return True, float("nan")
+        sim = F.cosine_similarity(prev_query_embed, cur_query_embed, dim=0).item()
+        # Two-way routing only:
+        #   high similarity -> fast heuristic context sampling
+        #   low similarity  -> semantic retrieval
+        use_retrieval = sim < self.route_retrieval_cosine_threshold
+        return use_retrieval, sim
+
+
+    def _scalar_ref_value(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.tolist()
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            return self._scalar_ref_value(value[0])
+        return value
+
+    def _normalize_refers_meta(self, refers_meta):
+        if refers_meta is None:
+            return []
+        if isinstance(refers_meta, tuple):
+            refers_meta = list(refers_meta)
+        if isinstance(refers_meta, dict):
+            return [{key: self._scalar_ref_value(value) for key, value in refers_meta.items()}]
+        if isinstance(refers_meta, list):
+            if len(refers_meta) == 1 and isinstance(refers_meta[0], list):
+                return refers_meta[0]
+            normalized = []
+            for item in refers_meta:
+                if isinstance(item, dict):
+                    normalized.append({key: self._scalar_ref_value(value) for key, value in item.items()})
+                elif isinstance(item, list):
+                    normalized.extend(item)
+            return normalized
+        return []
+
+    @torch.no_grad()
+    def _build_candidate_entries(self, shot_flags: torch.Tensor, latent_gen_iter: int):
+        candidate_entries = []
+        unique_flags = torch.unique(shot_flags)
+        for shot_flag in unique_flags.tolist():
+            shot_flag = int(shot_flag)
+            if shot_flag >= latent_gen_iter:
+                continue
+            indices = torch.where(shot_flags[0] == shot_flag)[0].tolist()
+            if len(indices) == 0:
+                continue
+            picked = [indices[0]]
+            if self.semantic_memory_frames_per_shot >= 2 and len(indices) > 1:
+                picked.append(indices[1])
+            for idx in picked:
+                candidate_entries.append((idx, shot_flag))
+        return candidate_entries
+
+    def _to_local_context_flags(self, shot_flags_list):
+        """
+        Remap global shot ids to compact local ids for context-only references.
+        """
+        unique_sorted = sorted(set(int(x) for x in shot_flags_list))
+        id_map = {sid: i for i, sid in enumerate(unique_sorted)}
+        return [id_map[int(x)] for x in shot_flags_list]
+
+    def _to_small_context_flags(self, shot_flags_list):
+        """
+        Map context shot ids to a small seen-like range for RoPE stability.
+        """
+        local_flags = self._to_local_context_flags(shot_flags_list)
+        max_id = max(0, int(self.context_rope_max_id))
+        return [min(int(v), max_id) for v in local_flags]
+
+    def _parse_refers_for_shot(self, refers_meta, latent_gen_iter: int, history_length: int):
+        if refers_meta is None:
+            return []
+        valid = []
+        for item in refers_meta:
+            if not isinstance(item, dict):
+                continue
+
+            target_shot_index = item.get("shot_index", None)
+            if target_shot_index is not None:
+                if int(target_shot_index) != int(latent_gen_iter):
+                    continue
+            else:
+                target_shot = item.get("shot", "all")
+                # `shot` follows JSON prompt numbering (`shot1`, `shot2`, ...),
+                # while latent_gen_iter is zero-based. Use `shot_index` for zero-based control.
+                if target_shot != "all" and int(target_shot) != int(latent_gen_iter) + 1:
+                    continue
+
+            image_path = item.get("image_path", None)
+            if image_path is not None:
+                valid.append(("image", image_path))
+                continue
+
+            idx = item.get("history_frame_idx", item.get("frame_idx", None))
+            if idx is None:
+                continue
+            idx = int(idx)
+            if 0 <= idx < history_length:
+                valid.append(("history", idx))
+        return valid
+
+    def _load_refer_image(self, image_path: str, height: int, width: int, device: torch.device, dtype: torch.dtype):
+        if not os.path.exists(image_path):
+            print(f"[Refers] skip missing image_path: {image_path}")
+            return None
+        image = Image.open(image_path).convert("RGB").resize((width, height), Image.BICUBIC)
+        image = np.asarray(image).astype("float32") / 255.0
+        image = image * 2.0 - 1.0
+        return torch.from_numpy(image).to(device=device, dtype=dtype)
+
+    def _build_refer_frames(self, refer_entries, history_video: torch.Tensor, device: torch.device, dtype: torch.dtype):
+        if len(refer_entries) == 0:
+            return None, []
+        height, width = history_video.shape[1], history_video.shape[2]
+        frames = []
+        sources = []
+        for refer_type, value in refer_entries:
+            if refer_type == "history":
+                frames.append(history_video[int(value)].to(device=device, dtype=dtype))
+                sources.append(f"refer:history:{int(value)}")
+            elif refer_type == "image":
+                frame = self._load_refer_image(str(value), height, width, device, dtype)
+                if frame is not None:
+                    frames.append(frame)
+                    sources.append(f"refer:image:{value}")
+        if len(frames) == 0:
+            return None, []
+        return torch.stack(frames, dim=0), sources
+
+    @torch.no_grad()
+    def _kv_retrieval_topk_history(
+        self,
+        history_video: torch.Tensor,
+        candidate_entries,
+        query_text: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        if len(candidate_entries) == 0:
+            return None, None
+
+        candidate_indices = [e[0] for e in candidate_entries]
+        candidate_shot_flags = [e[1] for e in candidate_entries]
+        candidate_frames = history_video[candidate_indices]
+        candidate_frames = rearrange(candidate_frames, 'f h w c -> f c 1 h w').to(device).to(dtype)
+        candidate_latents = self.vae.encode_to_latent(candidate_frames).to(device).to(dtype)
+        candidate_latents = rearrange(candidate_latents, 'f 1 c h w -> 1 f c h w')
+
+        batch_size = 1
+        num_candidates = candidate_latents.shape[1]
+        self._initialize_crossattn_cache(batch_size=batch_size, dtype=dtype, device=device)
+        self._initialize_context_kv_cache(
+            batch_size=batch_size,
+            dtype=dtype,
+            device=device,
+            kv_cache_size_override=num_candidates * self.frame_seq_length
+        )
+
+        conditional_dict = self.text_encoder(text_prompts=[query_text])
+        retrieval_timestep = torch.zeros([batch_size, num_candidates], device=device, dtype=torch.int64)
+        retrieval_shot_flags = torch.tensor(
+            self._to_small_context_flags(candidate_shot_flags), dtype=torch.int32, device=device
+        )
+        self.generator(
+            noisy_image_or_video=candidate_latents,
+            conditional_dict=conditional_dict,
+            timestep=retrieval_timestep,
+            kv_cache=None,
+            crossattn_cache=self.crossattn_cache,
+            kv_cache_context=self.kv_cache1_context,
+            shot_flags_for_rope=retrieval_shot_flags if self.change_rope else None,
+            current_start=0,
+            use_wo_rope_cache=False,
+        )
+
+        frame_token_count = self.frame_seq_length
+        num_layers = len(self.kv_cache1_context)
+        scores = []
+        for cand_i in range(num_candidates):
+            token_start = cand_i * frame_token_count
+            token_end = token_start + frame_token_count
+            layer_scores = []
+            for layer_i in range(num_layers):
+                q_layer = self.crossattn_cache[layer_i]["k"][0].mean(dim=0)  # [n, d]
+                k_frame = self.kv_cache1_context[layer_i]["k"][0, token_start:token_end]  # [t, n, d]
+                logits = (k_frame * q_layer.unsqueeze(0)).sum(dim=-1) / math.sqrt(q_layer.shape[-1])
+                attn = torch.softmax(logits, dim=0)
+                layer_scores.append((attn * logits).mean())
+            scores.append(torch.stack(layer_scores).mean())
+
+        scores = torch.stack(scores)
+        top_k = min(self.max_context_frames, scores.shape[0])
+        top_ids = torch.topk(scores, k=top_k, dim=0).indices.tolist()
+        selected_indices = [candidate_indices[i] for i in top_ids]
+        selected_shot_flags = [candidate_shot_flags[i] for i in top_ids]
+        selected_shot_flags = self._to_small_context_flags(selected_shot_flags)
+        if len(selected_indices) < self.max_context_frames and len(selected_indices) > 0:
+            pad_num = self.max_context_frames - len(selected_indices)
+            selected_indices += [selected_indices[-1]] * pad_num
+            selected_shot_flags += [selected_shot_flags[-1]] * pad_num
+        return selected_indices, selected_shot_flags
             
     @torch.no_grad()
     def inference(
@@ -74,15 +303,21 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         shots_captions = batch['shots_captions']
         shot_flags_gt = torch.tensor([batch['shot_flag']]).to(torch.int32) 
         shot_flags_unique_gt = torch.unique(shot_flags_gt)
+        refers_meta = self._normalize_refers_meta(batch.get('refers', []))
+        if refers_meta:
+            print(f"[Refers] loaded {len(refers_meta)} refer item(s) from batch")
 
         # Save generated results
         output_images_list = []
         shot_flags_output = []
+        prev_shot_query_embed = None
 
         for latent_gen_iter in range(len(shot_flags_unique_gt)):
             print(f"shot {latent_gen_iter} begin")
             shot_flags = torch.tensor(shot_flags_output).to(torch.int32) 
             shot_flags_unique = torch.unique(shot_flags)
+            current_shot_query = shots_captions[0][latent_gen_iter][0][0]
+            current_shot_query_embed = self._encode_shot_query(current_shot_query, device)
 
             if self.dynamic_sample_frames:
                 if latent_gen_iter > 0:
@@ -92,49 +327,165 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     counts = [base_count] * shot_number
                     for i in range(1, remainder + 1):
                         counts[-i] += 1
-                elif latent_gen_iter == 0:
+                else:
                     shot_number = 1
                     base_count = self.max_context_frames // shot_number
                     remainder = self.max_context_frames % shot_number
                     counts = [base_count] * shot_number
                     for i in range(1, remainder + 1):
                         counts[-i] += 1
+            else:
+                counts = [self.max_context_frames]
 
             condition_indices = []
             shot_flags_for_rope = []
+            text_context_indices = []
+            video_data = None
             
             if latent_gen_iter == 0:
                 condition_indices += [0] * counts[0]
                 shot_flags_for_rope += [0] * counts[0]
+                text_context_indices += [0] * counts[0]
                 # latent_indices = torch.where(shot_flags_gt[0]==0)
             else:
-                for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
-                    indices = torch.where(shot_flags==shot_flag)
-                    if shot_flag < latent_gen_iter:
-                        if self.dynamic_sample_frames:  # for dynamic sample frames
-                            start_idx = min(indices[0]).item()
-                            end_idx = max(indices[0]).item()
-                            sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
-                            sampled_indices = sampled_steps.round().long().tolist()
-                            condition_indices += sampled_indices
-                            shot_flags_for_rope += [shot_index] * len(sampled_indices)
-                        else:
-                            condition_indices.append(min(indices[0]).item())
-                            condition_indices.append(max(indices[0]).item())
-                    # elif shot_flag == latent_gen_iter:
-                    #     indices = torch.where(shot_flags_gt[0] == shot_flag)
-                    #     latent_indices = indices
-                    else:
-                        break
+                video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
+                video_data = rearrange(video_data, 'f c h w -> f h w c')
+                max_refers = min(int(self.max_context_frames * self.max_refers_ratio), self.max_context_frames // 2)
+                refer_entries = self._parse_refers_for_shot(
+                    refers_meta=refers_meta,
+                    latent_gen_iter=latent_gen_iter,
+                    history_length=video_data.shape[0]
+                )[:max_refers]
+                refer_frames, refer_sources = self._build_refer_frames(
+                    refer_entries=refer_entries,
+                    history_video=video_data,
+                    device=device,
+                    dtype=dtype,
+                )
+                refer_count = 0 if refer_frames is None else refer_frames.shape[0]
+                remaining_context = max(0, self.max_context_frames - refer_count)
+                if refer_count > 0:
+                    print(f"[Refers] shot={latent_gen_iter + 1}, inserted {refer_count} reference frame(s)")
+
+                use_retrieval = self.semantic_retrieval_context
+                if self.route_retrieval_by_prompt_similarity:
+                    use_retrieval, sim = self._should_use_retrieval(
+                        prev_query_embed=prev_shot_query_embed,
+                        cur_query_embed=current_shot_query_embed,
+                    )
+                    print(
+                        f"[Routing] shot={latent_gen_iter}, cosine(prev,cur)={sim:.4f}, "
+                        f"use_retrieval={use_retrieval}, threshold={self.route_retrieval_cosine_threshold}"
+                    )
+                if use_retrieval:
+                    # Retrieval query should come from current-shot prompt only
+                    # (exclude global prompt to avoid retrieval bias).
+                    query_text = current_shot_query
+                    candidate_entries = self._build_candidate_entries(shot_flags, latent_gen_iter)
+                    selected_indices, selected_shot_flags = self._kv_retrieval_topk_history(
+                        history_video=video_data,
+                        candidate_entries=candidate_entries,
+                        query_text=query_text,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    if selected_indices is not None:
+                        selected_indices = selected_indices[:remaining_context]
+                        selected_shot_flags = selected_shot_flags[:remaining_context]
+                        condition_indices += selected_indices
+                        shot_flags_for_rope += selected_shot_flags
+                        max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                        text_context_indices += [max(0, min(int(flag), max_prompt_flag)) for flag in selected_shot_flags]
+                if len(condition_indices) == 0:
+                    for shot_index, shot_flag in enumerate(shot_flags_unique_gt):
+                        indices = torch.where(shot_flags==shot_flag)
+                        if shot_flag < latent_gen_iter:
+                            if self.dynamic_sample_frames:  # for dynamic sample frames
+                                start_idx = min(indices[0]).item()
+                                end_idx = max(indices[0]).item()
+                                sampled_steps = torch.linspace(start_idx, end_idx, steps=counts[shot_index])
+                                sampled_indices = sampled_steps.round().long().tolist()
+                                condition_indices += sampled_indices
+                                shot_flags_for_rope += [shot_index] * len(sampled_indices)
+                                max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                                text_context_indices += [max(0, min(int(shot_index), max_prompt_flag))] * len(sampled_indices)
+                            else:
+                                condition_indices.append(min(indices[0]).item())
+                                condition_indices.append(max(indices[0]).item())
+                                shot_flags_for_rope += [shot_index, shot_index]
+                                max_prompt_flag = int(latent_gen_iter) if self.multi_caption else 0
+                                text_context_indices += [max(0, min(int(shot_index), max_prompt_flag))] * 2
+
+                condition_indices = condition_indices[:remaining_context]
+                shot_flags_for_rope = shot_flags_for_rope[:remaining_context]
+                text_context_indices = text_context_indices[:remaining_context]
 
             condition_indices = torch.tensor(condition_indices, dtype=torch.int32, device=device)
             if latent_gen_iter == 0:
                 # condition_frames = video_data_gt[condition_indices]  # f h w c
                 condition_frames = torch.zeros([self.max_context_frames, 480, 832, 3]).to(device).to(dtype)  # Hard Code for Resolution
             else:
-                video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
-                video_data = rearrange(video_data, 'f c h w -> f h w c')
-                condition_frames = video_data[condition_indices]  # f h w c
+                memory_indices_for_log = condition_indices.detach().cpu().tolist() if condition_indices.numel() > 0 else []
+                memory_frames = video_data[condition_indices] if condition_indices.numel() > 0 else video_data[:0]
+                fill_sources = None
+                if refer_frames is not None:
+                    refers_flag = self.refers_fixed_rope_id
+                    if refers_flag is None:
+                        refers_flag = int(self.context_rope_max_id)
+                    # Scheme B: split RoPE routing from text-context routing.
+                    # Refer frames get a compact RoPE id for positional stability, but
+                    # attend to the current shot prompt so the external image guides the
+                    # shot being generated instead of an older prompt bucket.
+                    refers_flag = max(0, min(int(refers_flag), int(self.context_rope_max_id)))
+                    refer_text_index = int(latent_gen_iter) if self.multi_caption else 0
+                    if self.refer_fill_context:
+                        # Experiment 1: diagnose whether the global context-KV route can
+                        # carry an external reference at all by replacing every context
+                        # slot with refer frame(s), after retrieval/sampling has run.
+                        if self.refer_fill_context_mode == "repeat_first":
+                            fill_indices = [0] * self.max_context_frames
+                        else:
+                            fill_indices = [i % refer_frames.shape[0] for i in range(self.max_context_frames)]
+                        fill_index_tensor = torch.tensor(fill_indices, dtype=torch.long, device=refer_frames.device)
+                        condition_frames = refer_frames.index_select(0, fill_index_tensor)
+                        shot_flags_for_rope = [refers_flag] * self.max_context_frames
+                        text_context_indices = [refer_text_index] * self.max_context_frames
+                        fill_sources = [refer_sources[i] for i in fill_indices]
+                        print(
+                            f"[Refers] shot={latent_gen_iter + 1}, fill all {self.max_context_frames} "
+                            f"context slot(s) with reference frame(s), mode={self.refer_fill_context_mode}"
+                        )
+                    else:
+                        condition_frames = torch.cat([refer_frames, memory_frames], dim=0)
+                        shot_flags_for_rope = [refers_flag] * refer_frames.shape[0] + shot_flags_for_rope
+                        text_context_indices = [refer_text_index] * refer_frames.shape[0] + text_context_indices
+                else:
+                    condition_frames = memory_frames
+
+                if condition_frames.shape[0] < self.max_context_frames and condition_frames.shape[0] > 0:
+                    pad_num = self.max_context_frames - condition_frames.shape[0]
+                    condition_frames = torch.cat([condition_frames, condition_frames[-1:].repeat(pad_num, 1, 1, 1)], dim=0)
+                    shot_flags_for_rope += [shot_flags_for_rope[-1]] * pad_num
+                    text_context_indices += [text_context_indices[-1]] * pad_num
+                condition_frames = condition_frames[:self.max_context_frames]
+                shot_flags_for_rope = shot_flags_for_rope[:self.max_context_frames]
+                text_context_indices = text_context_indices[:self.max_context_frames]
+                if self.debug_refers_context:
+                    if fill_sources is not None:
+                        memory_sources = []
+                        context_sources = fill_sources
+                    else:
+                        memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(refer_sources if refer_frames is not None else []))]
+                        context_sources = (refer_sources if refer_frames is not None else []) + memory_sources
+                    print(
+                        f"[Context] shot={latent_gen_iter + 1}, "
+                        f"refer_slots={0 if refer_frames is None else refer_frames.shape[0]}, "
+                        f"memory_slots={len(memory_sources)}, "
+                        f"final_frames={condition_frames.shape[0]}, "
+                        f"refer_fill_context={self.refer_fill_context}, "
+                        f"sources={context_sources}, rope_flags={shot_flags_for_rope}, "
+                        f"text_indices={text_context_indices}"
+                    )
 
             if self.dynamic_sample_frames:
                 assert condition_frames.shape[0] == self.max_context_frames
@@ -173,8 +524,10 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             # noise = torch.randn_like(video_latents)  # [1, f, c, h, w]
             noise = torch.randn([1, 21, condition_latents.shape[-3], condition_latents.shape[-2], condition_latents.shape[-1]]).to(device).to(dtype)  # [1, f, c, h, w]
 
-            shot_flags_for_rope += [shot_flags_for_rope[-1]+1] * noise.shape[1]
+            shot_flags_for_rope += [latent_gen_iter] * noise.shape[1]
+            text_context_indices += [latent_gen_iter if self.multi_caption else 0] * noise.shape[1]
             shot_flags_for_rope = torch.tensor(shot_flags_for_rope).to(torch.int32).to(device)
+            text_context_indices = torch.tensor(text_context_indices).to(torch.int32).to(device)
 
             batch_size, num_output_frames, num_channels, height, width = noise.shape
             
@@ -250,6 +603,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 ###
                 kv_cache_context=self.kv_cache1_context,
                 shot_flags_for_rope = shot_flags_for_rope[:condition_latents.shape[1]] if self.change_rope else None,
+                text_context_indices = text_context_indices[:condition_latents.shape[1]] if self.multi_caption else None,
                 ###
                 current_start=0,
             )
@@ -279,6 +633,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                             ###
                             kv_cache_context=self.kv_cache1_context,
                             shot_flags_for_rope = shot_flags_for_rope[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]]  if self.change_rope else None,
+                            text_context_indices = text_context_indices[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.multi_caption else None,
                             use_wo_rope_cache=use_wo_rope_cache,
                             ###
                             crossattn_cache=self.crossattn_cache,
@@ -301,6 +656,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                             ###
                             kv_cache_context=self.kv_cache1_context,
                             shot_flags_for_rope = shot_flags_for_rope[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.change_rope else None,
+                            text_context_indices = text_context_indices[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.multi_caption else None,
                             use_wo_rope_cache=use_wo_rope_cache,
                             ###
                             crossattn_cache=self.crossattn_cache,
@@ -320,6 +676,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     ###
                     kv_cache_context=self.kv_cache1_context,
                     shot_flags_for_rope = shot_flags_for_rope[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.change_rope else None,
+                    text_context_indices = text_context_indices[condition_latents.shape[1]+current_start_frame: condition_latents.shape[1]+current_start_frame+noisy_input.shape[1]] if self.multi_caption else None,
                     use_wo_rope_cache=use_wo_rope_cache,
                     ###
                 )
@@ -334,6 +691,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
             output_images_list.append(video[0])
             shot_flags_output += [latent_gen_iter] * video.shape[1]
+            prev_shot_query_embed = current_shot_query_embed.detach()
             print(f"shot {latent_gen_iter} end")
 
         video = torch.concat(output_images_list, dim=0)
