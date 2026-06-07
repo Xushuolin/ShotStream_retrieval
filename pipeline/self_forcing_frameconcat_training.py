@@ -57,6 +57,9 @@ class SelfForcingFrameconcatTrainingPipeline:
         else:
             if DEBUG:
                 print(f"Using static local_attn_size: {self.local_attn_size}")
+        self.sink_size = int(kwargs.get("sink_size", 0) or 0)
+        self.sink_rope_start_frame = int(kwargs.get("sink_rope_start_frame", 0) or 0)
+        self.use_wo_rope_cache = bool(kwargs.get("use_wo_rope_cache", self.sink_size > 0))
 
         # Context used for KV cache calculation
         num_training_frames: Optional[int] = kwargs.get("num_training_frames", 21)
@@ -176,8 +179,7 @@ class SelfForcingFrameconcatTrainingPipeline:
         local_start_frame = 0
         # If static local_attn_size, set it on the model before the step loop
         if not (isinstance(self.local_attn_size, (list, tuple)) or (hasattr(self.local_attn_size, "__iter__") and not isinstance(self.local_attn_size, (str, bytes)))):
-            self.generator.model.local_attn_size = int(self.local_attn_size)
-            self._set_all_modules_max_attention_size(int(self.local_attn_size))
+            self._set_all_modules_local_cache_policy(int(self.local_attn_size))
             
         for block_index, current_num_frames in enumerate(all_num_frames):
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -195,7 +197,7 @@ class SelfForcingFrameconcatTrainingPipeline:
                     self.generator.model.local_attn_size = int(self.local_attn_size[step_idx])
                     if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
                         print(f"[denoise step {step_idx}] timestep={float(current_timestep)} local_attn_size={self.generator.model.local_attn_size}")
-                    self._set_all_modules_max_attention_size(int(self.local_attn_size[step_idx]))
+                    self._set_all_modules_local_cache_policy(int(self.local_attn_size[step_idx]))
                 exit_flag = (
                     step_idx == exit_flags[0]
                     if self.same_step_across_blocks
@@ -378,10 +380,10 @@ class SelfForcingFrameconcatTrainingPipeline:
         start_gradient_frame_index = num_output_frames - slice_last_frames  # Only Calculate gradient in the slice frames
 
         grad_enable_mask = torch.zeros((batch_size, sum(all_num_frames)), dtype=torch.bool)  # [b, f]
+        use_wo_rope_cache = self.use_wo_rope_cache and shot_flags_for_rope is not None
         # If static local_attn_size, set it first
         if not isinstance(self.local_attn_size, (list, tuple)):
-            self.generator.model.local_attn_size = int(self.local_attn_size)  # 12
-            self._set_all_modules_max_attention_size(int(self.local_attn_size))
+            self._set_all_modules_local_cache_policy(int(self.local_attn_size))
         # for block_index in range(num_blocks):
         for block_index, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[
@@ -395,7 +397,7 @@ class SelfForcingFrameconcatTrainingPipeline:
                     self.generator.model.local_attn_size = int(self.local_attn_size[index])
                     if not dist.is_initialized() or dist.get_rank() == 0 and DEBUG:
                         print(f"[denoise step {index}] timestep={float(current_timestep)} local_attn_size={self.generator.model.local_attn_size}")
-                    self._set_all_modules_max_attention_size(int(self.local_attn_size[index]))
+                    self._set_all_modules_local_cache_policy(int(self.local_attn_size[index]))
                 if self.same_step_across_blocks:  # True
                     exit_flag = (index == exit_flags[0])
                 else:
@@ -417,6 +419,7 @@ class SelfForcingFrameconcatTrainingPipeline:
                             ###
                             kv_cache_context=self.kv_cache1_context,
                             shot_flags_for_rope=shot_flags_for_rope[context_latent.shape[1]+current_start_frame: context_latent.shape[1]+current_start_frame+noisy_input.shape[1]],
+                            use_wo_rope_cache=use_wo_rope_cache,
                             ###
                             current_start=current_start_frame * self.frame_seq_length
                         )
@@ -442,6 +445,7 @@ class SelfForcingFrameconcatTrainingPipeline:
                                 ###
                                 kv_cache_context=self.kv_cache1_context,
                                 shot_flags_for_rope=shot_flags_for_rope[context_latent.shape[1]+current_start_frame: context_latent.shape[1]+current_start_frame+noisy_input.shape[1]],
+                                use_wo_rope_cache=use_wo_rope_cache,
                                 ###
                                 crossattn_cache=self.crossattn_cache,
                                 current_start=current_start_frame * self.frame_seq_length
@@ -457,6 +461,7 @@ class SelfForcingFrameconcatTrainingPipeline:
                             ###
                             kv_cache_context=self.kv_cache1_context,
                             shot_flags_for_rope=shot_flags_for_rope[context_latent.shape[1]+current_start_frame: context_latent.shape[1]+current_start_frame+noisy_input.shape[1]],
+                            use_wo_rope_cache=use_wo_rope_cache,
                             ###
                             current_start=current_start_frame * self.frame_seq_length
                         )
@@ -487,6 +492,7 @@ class SelfForcingFrameconcatTrainingPipeline:
                     ###
                     kv_cache_context=self.kv_cache1_context,
                     shot_flags_for_rope=shot_flags_for_rope[context_latent.shape[1]+current_start_frame: context_latent.shape[1]+current_start_frame+noisy_input.shape[1]],
+                    use_wo_rope_cache=use_wo_rope_cache,
                     ###
                     current_start=current_start_frame * self.frame_seq_length
                 )
@@ -594,14 +600,12 @@ class SelfForcingFrameconcatTrainingPipeline:
                 blk["v"].zero_()
                 blk["is_init"] = False
 
-    def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
+    def _set_all_modules_local_cache_policy(self, local_attn_size_value: int):
         """
-        Set a unified upper bound for all submodules that contain the max_attention_size attribute.
-        local_attn_size_value == -1 indicates global attention (use Wan's default token limit 32760).
-        Otherwise set to local_attn_size_value * frame_seq_length.
+        Set local-window, sink, and compact sink-RoPE policy on all model modules.
         """
         if isinstance(local_attn_size_value, (list, tuple)):
-            raise ValueError("_set_all_modules_max_attention_size expects an int, got list/tuple.")
+            raise ValueError("_set_all_modules_local_cache_policy expects an int, got list/tuple.")
 
         if int(local_attn_size_value) == -1:
             target_size = 32760
@@ -609,8 +613,17 @@ class SelfForcingFrameconcatTrainingPipeline:
         else:
             target_size = int(local_attn_size_value) * self.frame_seq_length
             policy = "local"
+        sink_size_value = max(0, int(self.sink_size))
+        if int(local_attn_size_value) != -1 and sink_size_value >= int(local_attn_size_value):
+            sink_size_value = max(0, int(local_attn_size_value) - 1)
 
         # Root module
+        if hasattr(self.generator.model, "local_attn_size"):
+            setattr(self.generator.model, "local_attn_size", local_attn_size_value)
+        if hasattr(self.generator.model, "sink_size"):
+            setattr(self.generator.model, "sink_size", sink_size_value)
+        if hasattr(self.generator.model, "sink_rope_start_frame"):
+            setattr(self.generator.model, "sink_rope_start_frame", max(0, int(self.sink_rope_start_frame)))
         if hasattr(self.generator.model, "max_attention_size"):
             try:
                 _ = getattr(self.generator.model, "max_attention_size")
@@ -620,8 +633,18 @@ class SelfForcingFrameconcatTrainingPipeline:
 
         # Child modules
         for name, module in self.generator.model.named_modules():
-            if hasattr(module, "max_attention_size"):
-                try:
+            try:
+                if hasattr(module, "local_attn_size"):
+                    setattr(module, "local_attn_size", local_attn_size_value)
+                if hasattr(module, "sink_size"):
+                    setattr(module, "sink_size", sink_size_value)
+                if hasattr(module, "sink_rope_start_frame"):
+                    setattr(module, "sink_rope_start_frame", max(0, int(self.sink_rope_start_frame)))
+                if hasattr(module, "max_attention_size"):
                     setattr(module, "max_attention_size", target_size)
-                except Exception:
-                    pass
+            except Exception:
+                pass
+
+    def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
+        # Backward-compatible wrapper for older call sites.
+        self._set_all_modules_local_cache_policy(local_attn_size_value)

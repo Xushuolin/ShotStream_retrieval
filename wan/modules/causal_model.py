@@ -115,6 +115,11 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        # When keys are stored without RoPE (use_wo_rope_cache=True), re-apply
+        # RoPE to pinned sink tokens at a compact/fixed temporal position.  This
+        # mirrors the LongLive/Infinite-RoPE style sink behavior where the sink
+        # remains in-range instead of drifting to a very large historical index.
+        self.sink_rope_start_frame = 0
         self.qk_norm = qk_norm
         self.eps = eps
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
@@ -325,17 +330,37 @@ class CausalWanSelfAttention(nn.Module):
             # Use temporary k, v to compute attention
             if sink_tokens > 0:  # [TODO]
                 # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
+                active_sink_tokens = min(sink_tokens, local_end_index)
+                local_budget = self.max_attention_size - active_sink_tokens
+                k_sink = temp_k[:, :active_sink_tokens]
                 if use_wo_rope_cache:
-                    k_sink = causal_rope_apply_dynamic(k_sink, grid_sizes, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope, start_frame=condition_start_frame).type_as(v)   
-                v_sink = temp_v[:, :sink_tokens]
+                    sink_frame_count = k_sink.shape[1] // frame_seqlen
+                    if sink_frame_count > 0:
+                        grid_sizes_for_sink = grid_sizes.clone()
+                        grid_sizes_for_sink[0][0] = sink_frame_count
+                        sink_flag = 0
+                        if shot_flags_for_rope is not None and shot_flags_for_rope.numel() > 0:
+                            sink_flag = int(shot_flags_for_rope[0].item())
+                        shot_flags_for_rope_sink = torch.full(
+                            (sink_frame_count,),
+                            sink_flag,
+                            dtype=torch.int32,
+                            device=v.device,
+                        )
+                        k_sink = causal_rope_apply_dynamic(
+                            k_sink,
+                            grid_sizes_for_sink,
+                            freqs=freqs_dynamic,
+                            shot_flags_for_rope=shot_flags_for_rope_sink,
+                            start_frame=int(self.sink_rope_start_frame),
+                        ).type_as(v)
+                v_sink = temp_v[:, :active_sink_tokens]
                 # add for context
                 k_context =  kv_cache_context["k"].clone()
                 v_context = kv_cache_context["v"].clone()
 
                 if local_budget > 0:
-                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
+                    local_start_for_window = max(active_sink_tokens, local_end_index - local_budget)
                     k_local = temp_k[:, local_start_for_window:local_end_index]
                     if use_wo_rope_cache:
                         # rope_start_frame = rope_end_frame - k_local.shape[1] // 1560
@@ -477,6 +502,7 @@ class CausalWanAttentionBlock(nn.Module):
         ###
         kv_cache_context=None,
         shot_flags_for_rope=None,
+        text_context_indices=None,
         freqs_dynamic=None,
         use_wo_rope_cache=False,
         ###
@@ -517,9 +543,16 @@ class CausalWanAttentionBlock(nn.Module):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None, grid_sizes=None, shot_flags_for_rope=None):
-            x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache, grid_sizes=grid_sizes, shot_flags_for_rope=shot_flags_for_rope)
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None, grid_sizes=None, shot_flags_for_rope=None, text_context_indices=None):
+            x = x + self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                crossattn_cache=crossattn_cache,
+                grid_sizes=grid_sizes,
+                shot_flags_for_rope=shot_flags_for_rope,
+                text_context_indices=text_context_indices,
+            )
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -529,7 +562,7 @@ class CausalWanAttentionBlock(nn.Module):
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache, grid_sizes, shot_flags_for_rope)
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache, grid_sizes, shot_flags_for_rope, text_context_indices)
         
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
@@ -794,6 +827,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         ###
         kv_cache_context: dict = None,  # list, 30, kv_cache_context[0].keys() dict_keys(['k', 'v', 'is_init'])
         shot_flags_for_rope: torch.Tensor = None,
+        text_context_indices: torch.Tensor = None,
         use_wo_rope_cache: bool = False,  # whether use rope cache
         ###
         current_start: int = 0,  # token number
@@ -898,6 +932,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             ###
             freqs_dynamic=self.freqs_dynamic,
             shot_flags_for_rope=shot_flags_for_rope,
+            text_context_indices=text_context_indices,
             use_wo_rope_cache=use_wo_rope_cache,
             ###
         )
@@ -986,6 +1021,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         causal_use_condition_mask=False,
         condition_frame_number=None,
         shot_flags_for_rope=None,
+        text_context_indices=None,
         local_attn_size=None,
         sink_size=None,
     ):
@@ -1134,6 +1170,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             ###
             freqs_dynamic=self.freqs_dynamic,
             shot_flags_for_rope=shot_flags_for_rope,
+            text_context_indices=text_context_indices,
             ###
             )
             # block_mask=self.block_mask)
