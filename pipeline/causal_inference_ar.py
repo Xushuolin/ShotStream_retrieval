@@ -35,6 +35,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = getattr(args, "local_attn_size", 21)
+        self.sink_size = int(getattr(args, "sink_size", getattr(args, "model_kwargs", {}).get("sink_size", 0)))
+        self.sink_rope_start_frame = int(getattr(args, "sink_rope_start_frame", 0))
 
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"KV inference with {self.num_frame_per_block} frames per block")
@@ -297,6 +299,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         """
         # Step 1: Prepare data
         device, dtype = self.vae.model.encoder.conv1.weight.device, self.vae.model.encoder.conv1.weight.dtype 
+        if self.sink_size > 0 and getattr(self.args, "sink_use_wo_rope_cache", True):
+            use_wo_rope_cache = True
 
         # video_data_gt = torch.tensor(batch['data'][0]).to(device).to(dtype)  # [f h w c]
         global_captions = batch['global_captions']
@@ -581,9 +585,11 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             )
 
             current_start_frame = 0
-            self.generator.model.local_attn_size = self.local_attn_size
-            print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
-            self._set_all_modules_max_attention_size(self.local_attn_size)
+            self._set_all_modules_local_cache_policy(
+                local_attn_size_value=self.local_attn_size,
+                sink_size_value=self.sink_size,
+                sink_rope_start_frame=self.sink_rope_start_frame,
+            )
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device=device)
@@ -764,11 +770,19 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             })
         self.crossattn_cache = crossattn_cache
 
-    def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
+    def _set_all_modules_local_cache_policy(
+        self,
+        local_attn_size_value: int,
+        sink_size_value: int = 0,
+        sink_rope_start_frame: int = 0,
+    ):
         """
-        Set max_attention_size on all submodules that define it.
-        If local_attn_size_value == -1, use the model's global default (32760 for Wan, 28160 for 5B).
-        Otherwise, set to local_attn_size_value * frame_seq_length.
+        Apply local KV-cache policy to the root model and every attention module.
+
+        `sink_size_value` pins the first N generated frames in the local KV cache.
+        When use_wo_rope_cache=True, those sink keys are re-RoPE'd from
+        `sink_rope_start_frame` so the sink stays at a compact, training-range
+        temporal position (Infinite-RoPE/LongLive-style sink behavior).
         """
         if local_attn_size_value == -1:
             target_size = 32760
@@ -776,6 +790,10 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         else:
             target_size = int(local_attn_size_value) * self.frame_seq_length
             policy = "local"
+        sink_size_value = max(0, int(sink_size_value))
+        sink_rope_start_frame = max(0, int(sink_rope_start_frame))
+        if local_attn_size_value != -1 and sink_size_value >= int(local_attn_size_value):
+            sink_size_value = max(0, int(local_attn_size_value) - 1)
 
         updated_modules = []
         # Update root model if applicable
@@ -785,6 +803,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             except Exception:
                 prev = None
             setattr(self.generator.model, "max_attention_size", target_size)
+            setattr(self.generator.model, "local_attn_size", local_attn_size_value)
             updated_modules.append("<root_model>")
 
         # Update all child modules
@@ -796,9 +815,29 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     prev = None
                 try:
                     setattr(module, "max_attention_size", target_size)
+                    if hasattr(module, "local_attn_size"):
+                        setattr(module, "local_attn_size", local_attn_size_value)
+                    if hasattr(module, "sink_size"):
+                        setattr(module, "sink_size", sink_size_value)
+                    if hasattr(module, "sink_rope_start_frame"):
+                        setattr(module, "sink_rope_start_frame", sink_rope_start_frame)
                     updated_modules.append(name if name else module.__class__.__name__)
                 except Exception:
                     pass
+
+        print(
+            f"[inference] local_attn_size={local_attn_size_value}, "
+            f"sink_size={sink_size_value}, sink_rope_start_frame={sink_rope_start_frame}, "
+            f"attention_policy={policy}, max_attention_tokens={target_size}"
+        )
+
+    def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
+        # Backward-compatible wrapper for older call sites.
+        self._set_all_modules_local_cache_policy(
+            local_attn_size_value=local_attn_size_value,
+            sink_size_value=self.sink_size,
+            sink_rope_start_frame=self.sink_rope_start_frame,
+        )
 
 
     def _configure_lora_for_model(self, transformer, model_name):

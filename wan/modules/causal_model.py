@@ -115,6 +115,11 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        # When keys are stored without RoPE (use_wo_rope_cache=True), re-apply
+        # RoPE to pinned sink tokens at a compact/fixed temporal position.  This
+        # mirrors the LongLive/Infinite-RoPE style sink behavior where the sink
+        # remains in-range instead of drifting to a very large historical index.
+        self.sink_rope_start_frame = 0
         self.qk_norm = qk_norm
         self.eps = eps
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
@@ -325,17 +330,37 @@ class CausalWanSelfAttention(nn.Module):
             # Use temporary k, v to compute attention
             if sink_tokens > 0:  # [TODO]
                 # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
+                active_sink_tokens = min(sink_tokens, local_end_index)
+                local_budget = self.max_attention_size - active_sink_tokens
+                k_sink = temp_k[:, :active_sink_tokens]
                 if use_wo_rope_cache:
-                    k_sink = causal_rope_apply_dynamic(k_sink, grid_sizes, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope, start_frame=condition_start_frame).type_as(v)   
-                v_sink = temp_v[:, :sink_tokens]
+                    sink_frame_count = k_sink.shape[1] // frame_seqlen
+                    if sink_frame_count > 0:
+                        grid_sizes_for_sink = grid_sizes.clone()
+                        grid_sizes_for_sink[0][0] = sink_frame_count
+                        sink_flag = 0
+                        if shot_flags_for_rope is not None and shot_flags_for_rope.numel() > 0:
+                            sink_flag = int(shot_flags_for_rope[0].item())
+                        shot_flags_for_rope_sink = torch.full(
+                            (sink_frame_count,),
+                            sink_flag,
+                            dtype=torch.int32,
+                            device=v.device,
+                        )
+                        k_sink = causal_rope_apply_dynamic(
+                            k_sink,
+                            grid_sizes_for_sink,
+                            freqs=freqs_dynamic,
+                            shot_flags_for_rope=shot_flags_for_rope_sink,
+                            start_frame=int(self.sink_rope_start_frame),
+                        ).type_as(v)
+                v_sink = temp_v[:, :active_sink_tokens]
                 # add for context
                 k_context =  kv_cache_context["k"].clone()
                 v_context = kv_cache_context["v"].clone()
 
                 if local_budget > 0:
-                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
+                    local_start_for_window = max(active_sink_tokens, local_end_index - local_budget)
                     k_local = temp_k[:, local_start_for_window:local_end_index]
                     if use_wo_rope_cache:
                         # rope_start_frame = rope_end_frame - k_local.shape[1] // 1560
