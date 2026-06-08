@@ -362,11 +362,17 @@ class CausalWanSelfAttention(nn.Module):
                 if local_budget > 0:
                     local_start_for_window = max(active_sink_tokens, local_end_index - local_budget)
                     k_local = temp_k[:, local_start_for_window:local_end_index]
-                    if use_wo_rope_cache:
-                        # rope_start_frame = rope_end_frame - k_local.shape[1] // 1560
-                        shot_flags_for_rope_local = torch.tensor([shot_flags_for_rope[0].item()] * (k_local.shape[1] // 1560)).to(torch.int32).to(v.device) 
+                    local_frame_count = k_local.shape[1] // frame_seqlen
+                    if use_wo_rope_cache and local_frame_count > 0:
+                        # rope_start_frame = rope_end_frame - local_frame_count
+                        shot_flags_for_rope_local = torch.full(
+                            (local_frame_count,),
+                            int(shot_flags_for_rope[0].item()),
+                            dtype=torch.int32,
+                            device=v.device,
+                        )
                         grid_sizes_for_local = grid_sizes.clone()
-                        grid_sizes_for_local[0][0] = k_local.shape[1] // 1560
+                        grid_sizes_for_local[0][0] = local_frame_count
                         k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=rope_start_frame).type_as(v)
                     # print(f"use wo rope cache")
                     # print(f"rope_start_frame is {rope_start_frame}")
@@ -389,13 +395,19 @@ class CausalWanSelfAttention(nn.Module):
                 v_context = kv_cache_context["v"].clone()
                 k_local = temp_k[:, window_start:local_end_index]
                 v_local = temp_v[:, window_start:local_end_index]
-                if use_wo_rope_cache:
-                    # rope_start_frame = rope_end_frame - k_local.shape[1] // 1560
-                    # rope_start_frame = current_start_frame + condition_start_frame  - (k_local.shape[1] // 1560 - 3)
+                local_frame_count = k_local.shape[1] // frame_seqlen
+                if use_wo_rope_cache and local_frame_count > 0:
+                    # rope_start_frame = rope_end_frame - local_frame_count
+                    # rope_start_frame = current_start_frame + condition_start_frame  - (local_frame_count - 3)
                     rope_start_frame = 6
-                    shot_flags_for_rope_local = torch.tensor([shot_flags_for_rope[0].item()] * (k_local.shape[1] // 1560)).to(torch.int32).to(v.device) 
+                    shot_flags_for_rope_local = torch.full(
+                        (local_frame_count,),
+                        int(shot_flags_for_rope[0].item()),
+                        dtype=torch.int32,
+                        device=v.device,
+                    )
                     grid_sizes_for_local = grid_sizes.clone()
-                    grid_sizes_for_local[0][0] = k_local.shape[1] // 1560
+                    grid_sizes_for_local[0][0] = local_frame_count
                     k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=rope_start_frame).type_as(v)
                     # print(f"[DEBUG] Key: rope_start_frame is {rope_start_frame}  Key latent number is {k_local.shape[1] // 1560}  shot_flags_for_rope is {shot_flags_for_rope_local}")
 
