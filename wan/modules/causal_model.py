@@ -229,9 +229,11 @@ class CausalWanSelfAttention(nn.Module):
                     k, grid_sizes, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope, start_frame=current_start_frame + condition_start_frame).type_as(v)
 
             num_new_tokens = roped_query.shape[1]
+            query_frame_count = max(1, num_new_tokens // frame_seqlen)
             
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen  # sink_size=3
+            cached_local_end_before_insert = kv_cache["local_end_index"].item()
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
 
@@ -330,7 +332,11 @@ class CausalWanSelfAttention(nn.Module):
             # Use temporary k, v to compute attention
             if sink_tokens > 0:  # [TODO]
                 # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                active_sink_tokens = min(sink_tokens, local_end_index)
+                # Only frames that were already present in the cache before this
+                # forward call may act as sink. Newly generated frames should first
+                # be generated with normal/local RoPE, then become sink for later
+                # blocks after the clean-cache update.
+                active_sink_tokens = min(sink_tokens, cached_local_end_before_insert, local_end_index)
                 local_budget = self.max_attention_size - active_sink_tokens
                 k_sink = temp_k[:, :active_sink_tokens]
                 if use_wo_rope_cache:
@@ -352,7 +358,7 @@ class CausalWanSelfAttention(nn.Module):
                             grid_sizes_for_sink,
                             freqs=freqs_dynamic,
                             shot_flags_for_rope=shot_flags_for_rope_sink,
-                            start_frame=int(self.sink_rope_start_frame),
+                            start_frame=condition_start_frame + int(self.sink_rope_start_frame),
                         ).type_as(v)
                 v_sink = temp_v[:, :active_sink_tokens]
                 # add for context
@@ -364,7 +370,10 @@ class CausalWanSelfAttention(nn.Module):
                     k_local = temp_k[:, local_start_for_window:local_end_index]
                     local_frame_count = k_local.shape[1] // frame_seqlen
                     if use_wo_rope_cache and local_frame_count > 0:
-                        # rope_start_frame = rope_end_frame - local_frame_count
+                        local_key_rope_start_frame = max(
+                            condition_start_frame + (active_sink_tokens // frame_seqlen),
+                            rope_start_frame - max(0, local_frame_count - query_frame_count),
+                        )
                         shot_flags_for_rope_local = torch.full(
                             (local_frame_count,),
                             int(shot_flags_for_rope[0].item()),
@@ -373,7 +382,7 @@ class CausalWanSelfAttention(nn.Module):
                         )
                         grid_sizes_for_local = grid_sizes.clone()
                         grid_sizes_for_local[0][0] = local_frame_count
-                        k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=rope_start_frame).type_as(v)
+                        k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=local_key_rope_start_frame).type_as(v)
                     # print(f"use wo rope cache")
                     # print(f"rope_start_frame is {rope_start_frame}")
                     # print(f"shot_flags_for_rope is {shot_flags_for_rope}")
@@ -397,9 +406,10 @@ class CausalWanSelfAttention(nn.Module):
                 v_local = temp_v[:, window_start:local_end_index]
                 local_frame_count = k_local.shape[1] // frame_seqlen
                 if use_wo_rope_cache and local_frame_count > 0:
-                    # rope_start_frame = rope_end_frame - local_frame_count
-                    # rope_start_frame = current_start_frame + condition_start_frame  - (local_frame_count - 3)
-                    rope_start_frame = 6
+                    local_key_rope_start_frame = max(
+                        condition_start_frame,
+                        rope_start_frame - max(0, local_frame_count - query_frame_count),
+                    )
                     shot_flags_for_rope_local = torch.full(
                         (local_frame_count,),
                         int(shot_flags_for_rope[0].item()),
@@ -408,7 +418,7 @@ class CausalWanSelfAttention(nn.Module):
                     )
                     grid_sizes_for_local = grid_sizes.clone()
                     grid_sizes_for_local[0][0] = local_frame_count
-                    k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=rope_start_frame).type_as(v)
+                    k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=local_key_rope_start_frame).type_as(v)
                     # print(f"[DEBUG] Key: rope_start_frame is {rope_start_frame}  Key latent number is {k_local.shape[1] // 1560}  shot_flags_for_rope is {shot_flags_for_rope_local}")
 
                 k_cat = torch.cat([k_context, k_local], dim=1)
