@@ -14,6 +14,12 @@ change_rope: True
 max_context_frames: 6
 multi_caption: True
 
+# Local-KV sink / anchor policy used by causal initialization.
+local_attn_size: 21
+sink_size: 3
+sink_rope_start_frame: 0
+sink_use_wo_rope_cache: True
+
 denoising_step_list:
 - 1000
 - 740
