@@ -6,9 +6,9 @@ dmd_debug: False
 trainer: score_distillation_frameconcat_stream
 
 # if need dynamic sample + change rope
-dynamic_sample_frames: True
+dynamic_sample_frames: False
 change_rope: True
-max_context_frames: 6 
+max_context_frames: 3 
 multi_caption: True
 
 # Local-KV sink / anchor for streaming inference.
@@ -16,7 +16,7 @@ multi_caption: True
 # with `sink_use_wo_rope_cache`, sink keys are re-RoPE'd to a compact fixed
 # temporal position (`sink_rope_start_frame`) during inference.
 local_attn_size: 21
-sink_size: 3
+sink_size: 6
 sink_rope_start_frame: 0
 sink_use_wo_rope_cache: True
 
