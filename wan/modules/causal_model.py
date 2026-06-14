@@ -968,7 +968,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_update_infos = []  # Collect cache update info for all blocks
         for block_index, block in enumerate(self.blocks):
             # print(f"block_index: {block_index}")
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            # Activation checkpointing re-runs the block during backward.  In
+            # causal rollout/training the KV caches are intentionally mutated
+            # after the original forward (see _apply_cache_updates below), so
+            # recomputation would observe a newer cache state than the original
+            # checkpointed forward.  That can change sink/local-window branches
+            # and trip PyTorch's non-reentrant checkpoint metadata checks
+            # ("different number of tensors saved").  Keep checkpointing for
+            # stateless/non-cache forwards, but run cacheful forwards normally.
+            can_checkpoint = (
+                torch.is_grad_enabled()
+                and self.gradient_checkpointing
+                and kv_cache is None
+                and kv_cache_context is None
+            )
+            if can_checkpoint:
                 kwargs.update(
                     {
                         # "kv_cache": kv_cache[block_index],
