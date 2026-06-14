@@ -30,8 +30,9 @@ class BaseModel(nn.Module):
         self.model_name = getattr(args, "model_name", "Wan2.1-T2V-1.3B")
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
-        self.local_attn_size = getattr(args, "model_kwargs", {}).get("local_attn_size", -1)
-        self.sink_size = getattr(args, "model_kwargs", {}).get("sink_size", 0)
+        model_kwargs = getattr(args, "model_kwargs", {})
+        self.local_attn_size = getattr(args, "local_attn_size", model_kwargs.get("local_attn_size", -1))
+        self.sink_size = getattr(args, "sink_size", model_kwargs.get("sink_size", 0))
         # self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True, timestep_shift=args.timestep_shift)
         self.generator = WanDiffusionWrapper(model_name=self.model_name, is_causal=True, timestep_shift=args.timestep_shift, local_attn_size=self.local_attn_size, sink_size=self.sink_size)
         self.generator.model.requires_grad_(True)
@@ -231,7 +232,11 @@ class SelfForcingModel(BaseModel):
         Here we encapsulate the inference code with a model-dependent outside function.
         We pass our FSDP-wrapped modules into the pipeline to save memory.
         """
-        local_attn_size = getattr(self.args, "model_kwargs", {}).get("local_attn_size", -1)
+        model_kwargs = getattr(self.args, "model_kwargs", {})
+        local_attn_size = getattr(self.args, "local_attn_size", model_kwargs.get("local_attn_size", -1))
+        sink_size = getattr(self.args, "sink_size", model_kwargs.get("sink_size", 0))
+        sink_rope_start_frame = getattr(self.args, "sink_rope_start_frame", 0)
+        sink_use_wo_rope_cache = getattr(self.args, "sink_use_wo_rope_cache", True)
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         # do not use self.num_training_frames, because it is changed by generator_loss and critic_loss
         num_training_frames = getattr(self.args, "num_training_frames")
@@ -249,6 +254,9 @@ class SelfForcingModel(BaseModel):
             num_max_frames=num_training_frames,
             context_noise=self.args.context_noise,
             local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            sink_rope_start_frame=sink_rope_start_frame,
+            use_wo_rope_cache=bool(sink_size > 0 and sink_use_wo_rope_cache),
             slice_last_frames=slice_last_frames,
             num_training_frames=num_training_frames,
         )
@@ -385,7 +393,11 @@ class SelfForcingFrameConcatModel(BaseModel):
         Here we encapsulate the inference code with a model-dependent outside function.
         We pass our FSDP-wrapped modules into the pipeline to save memory.
         """
-        local_attn_size = getattr(self.args, "model_kwargs", {}).get("local_attn_size", -1)
+        model_kwargs = getattr(self.args, "model_kwargs", {})
+        local_attn_size = getattr(self.args, "local_attn_size", model_kwargs.get("local_attn_size", -1))
+        sink_size = getattr(self.args, "sink_size", model_kwargs.get("sink_size", 0))
+        sink_rope_start_frame = getattr(self.args, "sink_rope_start_frame", 0)
+        sink_use_wo_rope_cache = getattr(self.args, "sink_use_wo_rope_cache", True)
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         # do not use self.num_training_frames, because it is changed by generator_loss and critic_loss
         num_training_frames = getattr(self.args, "num_training_frames")
@@ -403,6 +415,9 @@ class SelfForcingFrameConcatModel(BaseModel):
             num_max_frames=num_training_frames,
             context_noise=self.args.context_noise,
             local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            sink_rope_start_frame=sink_rope_start_frame,
+            use_wo_rope_cache=bool(sink_size > 0 and sink_use_wo_rope_cache),
             slice_last_frames=slice_last_frames,
             num_training_frames=num_training_frames,
         )
@@ -459,8 +474,9 @@ class FrameConcatCausalModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
         self.model_name = getattr(args, "model_name", "Wan2.1-T2V-1.3B")
-        self.local_attn_size = getattr(args, "model_kwargs", {}).get("local_attn_size", -1)
-        self.sink_size = getattr(args, "model_kwargs", {}).get("sink_size", 0)
+        model_kwargs = getattr(args, "model_kwargs", {})
+        self.local_attn_size = getattr(args, "local_attn_size", model_kwargs.get("local_attn_size", -1))
+        self.sink_size = getattr(args, "sink_size", model_kwargs.get("sink_size", 0))
         print(f"Begin to set timestep shift is {args.timestep_shift}")
         self.generator = WanDiffusionWrapper(model_name=self.model_name, is_causal=True, timestep_shift=args.timestep_shift, local_attn_size=self.local_attn_size, sink_size=self.sink_size).to(device)
 
