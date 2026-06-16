@@ -6,9 +6,9 @@ dmd_debug: False
 trainer: score_distillation_frameconcat_stream
 
 # if need dynamic sample + change rope
-dynamic_sample_frames: True
+dynamic_sample_frames: False
 change_rope: True
-max_context_frames: 6 
+max_context_frames: 3 
 multi_caption: True
 
 # Local-KV sink / anchor for streaming inference.
