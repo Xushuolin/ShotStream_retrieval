@@ -6,9 +6,9 @@ dmd_debug: False
 trainer: score_distillation_frameconcat
 
 # if need dynamic sample + change rope
-dynamic_sample_frames: True
+dynamic_sample_frames: False
 change_rope: True
-max_context_frames: 6 
+max_context_frames: 3 
 multi_caption: True
 
 # Local-KV sink / anchor policy used by DMD generator rollout.
@@ -63,7 +63,7 @@ total_batch_size: 64
 restrict_max_length: 81
 
 # log 
-log_iters: 50
+log_iters: 500
 max_iters: 30000
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
 
