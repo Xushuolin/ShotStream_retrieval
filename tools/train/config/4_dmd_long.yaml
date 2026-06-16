@@ -11,6 +11,15 @@ change_rope: True
 max_context_frames: 6 
 multi_caption: True
 
+# Local-KV sink / anchor for streaming inference.
+# The first `sink_size` generated frames stay pinned in the local KV cache;
+# with `sink_use_wo_rope_cache`, sink keys are re-RoPE'd to a compact fixed
+# temporal position (`sink_rope_start_frame`) during inference.
+local_attn_size: 21
+sink_size: 3
+sink_rope_start_frame: 0
+sink_use_wo_rope_cache: True
+
 # Lora Setting
 train_lora: True
 
