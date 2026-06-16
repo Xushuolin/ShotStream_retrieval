@@ -56,6 +56,9 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.refer_fill_context_mode = getattr(args, "refer_fill_context_mode", "cycle")
         self.sink_swap_refers = getattr(args, "sink_swap_refers", False)
         self.sink_swap_refers_mode = getattr(args, "sink_swap_refers_mode", "cycle")
+        self.sink_swap_refers_after_blocks = int(getattr(args, "sink_swap_refers_after_blocks", 0))
+        self.sink_swap_refers_start_slot = int(getattr(args, "sink_swap_refers_start_slot", 0))
+        self.sink_swap_refers_num_slots = int(getattr(args, "sink_swap_refers_num_slots", -1))
         self.debug_refers_context = getattr(args, "debug_refers_context", True)
         self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
         self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
@@ -208,10 +211,12 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             return None, []
         return torch.stack(frames, dim=0), sources
 
-    def _select_sink_refer_frames(self, refer_frames: torch.Tensor):
+    def _select_sink_refer_frames(self, refer_frames: torch.Tensor, sink_count: int | None = None):
         if refer_frames is None or refer_frames.shape[0] == 0 or self.sink_size <= 0:
             return None
-        sink_count = int(self.sink_size)
+        sink_count = int(self.sink_size if sink_count is None else sink_count)
+        if sink_count <= 0:
+            return None
         if self.sink_swap_refers_mode == "repeat_first":
             indices = [0] * sink_count
         else:
@@ -283,6 +288,98 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             cache["global_end_index"].zero_()
             cache["local_end_index"].fill_(sink_tokens)
         return sink_frame_count
+
+    def _new_local_kv_cache(self, batch_size: int, kv_cache_size: int, dtype: torch.dtype, device: torch.device):
+        kv_cache = []
+        for _ in range(self.num_transformer_blocks):
+            kv_cache.append({
+                "k": torch.zeros([batch_size, kv_cache_size, self.num_heads, self.d], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, self.num_heads, self.d], dtype=dtype, device=device),
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+            })
+        return kv_cache
+
+    @torch.no_grad()
+    def _swap_local_sink_slots_with_refers(
+        self,
+        refer_frames: torch.Tensor,
+        conditional_dict,
+        dtype: torch.dtype,
+        device: torch.device,
+        shot_index: int,
+        use_wo_rope_cache: bool,
+    ):
+        """
+        Delayed/partial sink swap: after the current shot has generated enough
+        clean frames to populate its own sink, replace a configurable sink-slot
+        range with refer-frame KV while preserving all cache pointers.
+        """
+        if refer_frames is None or self.kv_cache1 is None or self.sink_size <= 0:
+            return 0, 0, 0
+
+        start_slot = max(0, min(int(self.sink_swap_refers_start_slot), int(self.sink_size)))
+        if self.sink_swap_refers_num_slots < 0:
+            num_slots = int(self.sink_size) - start_slot
+        else:
+            num_slots = int(self.sink_swap_refers_num_slots)
+        num_slots = max(0, min(num_slots, int(self.sink_size) - start_slot))
+        if num_slots <= 0:
+            return 0, start_slot, 0
+
+        sink_frames = self._select_sink_refer_frames(refer_frames, sink_count=num_slots)
+        if sink_frames is None:
+            return 0, start_slot, num_slots
+
+        sink_frames = rearrange(sink_frames, 'f h w c -> f c 1 h w').to(device=device, dtype=dtype)
+        sink_latents = self.vae.encode_to_latent(sink_frames).to(device=device, dtype=dtype)
+        sink_latents = rearrange(sink_latents, 'f 1 c h w -> 1 f c h w')
+
+        sink_frame_count = sink_latents.shape[1]
+        sink_tokens = sink_frame_count * self.frame_seq_length
+        temp_kv_cache = self._new_local_kv_cache(
+            batch_size=sink_latents.shape[0],
+            kv_cache_size=sink_tokens,
+            dtype=dtype,
+            device=device,
+        )
+        timestep = torch.zeros(
+            [sink_latents.shape[0], sink_frame_count],
+            device=device,
+            dtype=torch.int64,
+        )
+        sink_shot_flags = torch.full(
+            (sink_frame_count,),
+            int(shot_index),
+            dtype=torch.int32,
+            device=device,
+        )
+        sink_text_indices = torch.full(
+            (sink_frame_count,),
+            int(shot_index) if self.multi_caption else 0,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        self.generator(
+            noisy_image_or_video=sink_latents,
+            conditional_dict=conditional_dict,
+            timestep=timestep,
+            kv_cache=temp_kv_cache,
+            kv_cache_context=self.kv_cache1_context,
+            crossattn_cache=self.crossattn_cache,
+            shot_flags_for_rope=sink_shot_flags if self.change_rope else None,
+            text_context_indices=sink_text_indices if self.multi_caption else None,
+            use_wo_rope_cache=use_wo_rope_cache,
+            current_start=0,
+        )
+
+        target_start = start_slot * self.frame_seq_length
+        target_end = target_start + sink_tokens
+        for cache, ref_cache in zip(self.kv_cache1, temp_kv_cache):
+            cache["k"][:, target_start:target_end] = ref_cache["k"][:, :sink_tokens]
+            cache["v"][:, target_start:target_end] = ref_cache["v"][:, :sink_tokens]
+        return sink_frame_count, start_slot, num_slots
 
     @torch.no_grad()
     def _kv_retrieval_topk_history(
@@ -706,7 +803,12 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 current_start=0,
             )
 
-            if self.sink_swap_refers and refer_frames is not None and self.sink_size > 0:
+            if (
+                self.sink_swap_refers
+                and self.sink_swap_refers_after_blocks <= 0
+                and refer_frames is not None
+                and self.sink_size > 0
+            ):
                 sink_prefill_count = self._prefill_local_sink_with_refers(
                     refer_frames=refer_frames,
                     conditional_dict=conditional_dict,
@@ -723,7 +825,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
 
             # Step 2: Temporal denoising loop
             all_num_frames = [self.num_frame_per_block] * num_blocks
-            for current_num_frames in all_num_frames:
+            sink_swap_applied = self.sink_swap_refers_after_blocks <= 0
+            for block_index, current_num_frames in enumerate(all_num_frames):
 
                 noisy_input = noise[
                     :, current_start_frame:current_start_frame + current_num_frames]
@@ -793,6 +896,30 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     use_wo_rope_cache=use_wo_rope_cache,
                     ###
                 )
+
+                if (
+                    self.sink_swap_refers
+                    and not sink_swap_applied
+                    and refer_frames is not None
+                    and self.sink_size > 0
+                    and (block_index + 1) >= self.sink_swap_refers_after_blocks
+                ):
+                    sink_swap_count, sink_start_slot, sink_num_slots = self._swap_local_sink_slots_with_refers(
+                        refer_frames=refer_frames,
+                        conditional_dict=conditional_dict,
+                        dtype=dtype,
+                        device=device,
+                        shot_index=latent_gen_iter,
+                        use_wo_rope_cache=use_wo_rope_cache,
+                    )
+                    sink_swap_applied = True
+                    if sink_swap_count > 0:
+                        print(
+                            f"[SinkSwap] shot={latent_gen_iter + 1}, delayed swap after "
+                            f"{block_index + 1} block(s), replaced sink slot(s) "
+                            f"{sink_start_slot}:{sink_start_slot + sink_num_slots} "
+                            f"with {sink_swap_count} refer frame(s), mode={self.sink_swap_refers_mode}"
+                        )
 
                 # Step 3.4: update the start and end frame indices
                 current_start_frame += current_num_frames

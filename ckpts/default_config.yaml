@@ -20,6 +20,9 @@ refer_fill_context: False
 refer_fill_context_mode: cycle
 sink_swap_refers: False
 sink_swap_refers_mode: cycle
+sink_swap_refers_after_blocks: 0
+sink_swap_refers_start_slot: 0
+sink_swap_refers_num_slots: -1
 debug_refers_context: True
 
 # local-KV sink / anchor policy
