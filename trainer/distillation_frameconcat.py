@@ -71,9 +71,9 @@ class Trainer:
         self.train_lora = getattr(config, "train_lora", False)
         self.train_lora_generator = getattr(config, "train_lora_generator", False)
         self.multi_caption = getattr(config, "multi_caption", False)  # for multi caption
-        self.semantic_retrieval_context = getattr(config, "semantic_retrieval_context", True)
+        self.semantic_retrieval_context = getattr(config, "semantic_retrieval_context", False)
         self.semantic_memory_frames_per_shot = getattr(config, "semantic_memory_frames_per_shot", 1)
-        self.context_rope_max_id = getattr(config, "context_rope_max_id", 3)
+        self.context_rope_max_id = getattr(config, "context_rope_max_id", 2)
 
         self.train_lora_fake = getattr(config, "train_lora_fake", False)
         print(f"self.train_lora_fake is {self.train_lora_fake}")

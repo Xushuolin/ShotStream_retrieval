@@ -54,6 +54,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
         self.refers_fixed_rope_id = getattr(args, "refers_fixed_rope_id", None)
         self.refer_fill_context = getattr(args, "refer_fill_context", False)
         self.refer_fill_context_mode = getattr(args, "refer_fill_context_mode", "cycle")
+        self.sink_swap_refers = getattr(args, "sink_swap_refers", False)
+        self.sink_swap_refers_mode = getattr(args, "sink_swap_refers_mode", "cycle")
         self.debug_refers_context = getattr(args, "debug_refers_context", True)
         self.route_retrieval_by_prompt_similarity = getattr(args, "route_retrieval_by_prompt_similarity", False)
         self.route_retrieval_cosine_threshold = getattr(args, "route_retrieval_cosine_threshold", 0.80)
@@ -206,6 +208,82 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             return None, []
         return torch.stack(frames, dim=0), sources
 
+    def _select_sink_refer_frames(self, refer_frames: torch.Tensor):
+        if refer_frames is None or refer_frames.shape[0] == 0 or self.sink_size <= 0:
+            return None
+        sink_count = int(self.sink_size)
+        if self.sink_swap_refers_mode == "repeat_first":
+            indices = [0] * sink_count
+        else:
+            indices = [i % refer_frames.shape[0] for i in range(sink_count)]
+        index_tensor = torch.tensor(indices, dtype=torch.long, device=refer_frames.device)
+        return refer_frames.index_select(0, index_tensor)
+
+    @torch.no_grad()
+    def _prefill_local_sink_with_refers(
+        self,
+        refer_frames: torch.Tensor,
+        conditional_dict,
+        dtype: torch.dtype,
+        device: torch.device,
+        shot_index: int,
+        use_wo_rope_cache: bool,
+    ):
+        """
+        SPAWN-style anchor swap experiment: encode external refer frame(s) and
+        write their KV into the pinned local sink slots before the shot rollout.
+
+        The local cache pointer is left at `sink_size` frames so the next
+        generation block can attend to these entries as active sink tokens, but
+        global_end_index is reset to 0 so the shot itself still starts at time 0.
+        """
+        sink_frames = self._select_sink_refer_frames(refer_frames)
+        if sink_frames is None:
+            return 0
+
+        sink_frames = rearrange(sink_frames, 'f h w c -> f c 1 h w').to(device=device, dtype=dtype)
+        sink_latents = self.vae.encode_to_latent(sink_frames).to(device=device, dtype=dtype)
+        sink_latents = rearrange(sink_latents, 'f 1 c h w -> 1 f c h w')
+
+        sink_frame_count = sink_latents.shape[1]
+        timestep = torch.zeros(
+            [sink_latents.shape[0], sink_frame_count],
+            device=device,
+            dtype=torch.int64,
+        )
+        sink_shot_flags = torch.full(
+            (sink_frame_count,),
+            int(shot_index),
+            dtype=torch.int32,
+            device=device,
+        )
+        sink_text_indices = torch.full(
+            (sink_frame_count,),
+            int(shot_index) if self.multi_caption else 0,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        self.generator(
+            noisy_image_or_video=sink_latents,
+            conditional_dict=conditional_dict,
+            timestep=timestep,
+            kv_cache=self.kv_cache1,
+            kv_cache_context=self.kv_cache1_context,
+            crossattn_cache=self.crossattn_cache,
+            shot_flags_for_rope=sink_shot_flags if self.change_rope else None,
+            text_context_indices=sink_text_indices if self.multi_caption else None,
+            use_wo_rope_cache=use_wo_rope_cache,
+            current_start=0,
+        )
+
+        # Keep refer KV in the local sink region, but do not advance global time.
+        sink_tokens = sink_frame_count * self.frame_seq_length
+        for cache in self.kv_cache1:
+            cache["global_end_index"].zero_()
+            cache["local_end_index"].fill_(sink_tokens)
+        return sink_frame_count
+
     @torch.no_grad()
     def _kv_retrieval_topk_history(
         self,
@@ -345,6 +423,8 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             shot_flags_for_rope = []
             text_context_indices = []
             video_data = None
+            refer_frames = None
+            refer_sources = []
             
             if latent_gen_iter == 0:
                 condition_indices += [0] * counts[0]
@@ -354,7 +434,14 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
             else:
                 video_data = torch.concat(output_images_list, dim=0).to(device).to(dtype)
                 video_data = rearrange(video_data, 'f c h w -> f h w c')
-                max_refers = min(int(self.max_context_frames * self.max_refers_ratio), self.max_context_frames // 2)
+                context_max_refers = min(int(self.max_context_frames * self.max_refers_ratio), self.max_context_frames // 2)
+                max_refers = context_max_refers
+                # Sink-swap is a separate anchor-injection experiment from the
+                # global context slots.  Keep at least one refer available for
+                # sink prefill even when max_refers_ratio=0 is used to disable
+                # ordinary refer context insertion.
+                if self.sink_swap_refers and self.sink_size > 0:
+                    max_refers = max(max_refers, 1)
                 refer_entries = self._parse_refers_for_shot(
                     refers_meta=refers_meta,
                     latent_gen_iter=latent_gen_iter,
@@ -366,7 +453,12 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                     device=device,
                     dtype=dtype,
                 )
-                refer_count = 0 if refer_frames is None else refer_frames.shape[0]
+                context_refer_frames = None
+                context_refer_sources = []
+                if refer_frames is not None and context_max_refers > 0:
+                    context_refer_frames = refer_frames[:context_max_refers]
+                    context_refer_sources = refer_sources[:context_max_refers]
+                refer_count = 0 if context_refer_frames is None else context_refer_frames.shape[0]
                 remaining_context = max(0, self.max_context_frames - refer_count)
                 if refer_count > 0:
                     print(f"[Refers] shot={latent_gen_iter + 1}, inserted {refer_count} reference frame(s)")
@@ -432,7 +524,7 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 memory_indices_for_log = condition_indices.detach().cpu().tolist() if condition_indices.numel() > 0 else []
                 memory_frames = video_data[condition_indices] if condition_indices.numel() > 0 else video_data[:0]
                 fill_sources = None
-                if refer_frames is not None:
+                if context_refer_frames is not None:
                     refers_flag = self.refers_fixed_rope_id
                     if refers_flag is None:
                         refers_flag = int(self.context_rope_max_id)
@@ -449,20 +541,20 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                         if self.refer_fill_context_mode == "repeat_first":
                             fill_indices = [0] * self.max_context_frames
                         else:
-                            fill_indices = [i % refer_frames.shape[0] for i in range(self.max_context_frames)]
-                        fill_index_tensor = torch.tensor(fill_indices, dtype=torch.long, device=refer_frames.device)
-                        condition_frames = refer_frames.index_select(0, fill_index_tensor)
+                            fill_indices = [i % context_refer_frames.shape[0] for i in range(self.max_context_frames)]
+                        fill_index_tensor = torch.tensor(fill_indices, dtype=torch.long, device=context_refer_frames.device)
+                        condition_frames = context_refer_frames.index_select(0, fill_index_tensor)
                         shot_flags_for_rope = [refers_flag] * self.max_context_frames
                         text_context_indices = [refer_text_index] * self.max_context_frames
-                        fill_sources = [refer_sources[i] for i in fill_indices]
+                        fill_sources = [context_refer_sources[i] for i in fill_indices]
                         print(
                             f"[Refers] shot={latent_gen_iter + 1}, fill all {self.max_context_frames} "
                             f"context slot(s) with reference frame(s), mode={self.refer_fill_context_mode}"
                         )
                     else:
-                        condition_frames = torch.cat([refer_frames, memory_frames], dim=0)
-                        shot_flags_for_rope = [refers_flag] * refer_frames.shape[0] + shot_flags_for_rope
-                        text_context_indices = [refer_text_index] * refer_frames.shape[0] + text_context_indices
+                        condition_frames = torch.cat([context_refer_frames, memory_frames], dim=0)
+                        shot_flags_for_rope = [refers_flag] * context_refer_frames.shape[0] + shot_flags_for_rope
+                        text_context_indices = [refer_text_index] * context_refer_frames.shape[0] + text_context_indices
                 else:
                     condition_frames = memory_frames
 
@@ -479,11 +571,11 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                         memory_sources = []
                         context_sources = fill_sources
                     else:
-                        memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(refer_sources if refer_frames is not None else []))]
-                        context_sources = (refer_sources if refer_frames is not None else []) + memory_sources
+                        memory_sources = [f"memory:{idx}" for idx in memory_indices_for_log][:max(0, self.max_context_frames - len(context_refer_sources))]
+                        context_sources = context_refer_sources + memory_sources
                     print(
                         f"[Context] shot={latent_gen_iter + 1}, "
-                        f"refer_slots={0 if refer_frames is None else refer_frames.shape[0]}, "
+                        f"refer_slots={0 if context_refer_frames is None else context_refer_frames.shape[0]}, "
                         f"memory_slots={len(memory_sources)}, "
                         f"final_frames={condition_frames.shape[0]}, "
                         f"refer_fill_context={self.refer_fill_context}, "
@@ -613,6 +705,21 @@ class CausalInferenceArPipeline(FrameConcatCausalModel):
                 ###
                 current_start=0,
             )
+
+            if self.sink_swap_refers and refer_frames is not None and self.sink_size > 0:
+                sink_prefill_count = self._prefill_local_sink_with_refers(
+                    refer_frames=refer_frames,
+                    conditional_dict=conditional_dict,
+                    dtype=dtype,
+                    device=device,
+                    shot_index=latent_gen_iter,
+                    use_wo_rope_cache=use_wo_rope_cache,
+                )
+                if sink_prefill_count > 0:
+                    print(
+                        f"[SinkSwap] shot={latent_gen_iter + 1}, prefilled {sink_prefill_count} "
+                        f"sink frame(s) from refer frame(s), mode={self.sink_swap_refers_mode}"
+                    )
 
             # Step 2: Temporal denoising loop
             all_num_frames = [self.num_frame_per_block] * num_blocks

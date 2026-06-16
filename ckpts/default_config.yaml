@@ -18,6 +18,8 @@ max_refers_ratio: 0.5
 refers_fixed_rope_id: null
 refer_fill_context: False
 refer_fill_context_mode: cycle
+sink_swap_refers: False
+sink_swap_refers_mode: cycle
 debug_refers_context: True
 
 # local-KV sink / anchor policy
