@@ -1,0 +1,68 @@
+# Default inference config for Inference_Causal.py.
+# This file is merged first; values in --config_path override these defaults.
+
+# dynamic sample + change rope
+dynamic_sample_frames: False
+semantic_retrieval_context: False
+semantic_memory_frames_per_shot: 1
+route_retrieval_by_prompt_similarity: False
+route_retrieval_cosine_threshold: 0.80
+change_rope: True
+context_rope_max_id: 2
+max_context_frames: 3
+multi_caption: True
+restrict_max_length: 81
+
+# external refer/context controls
+max_refers_ratio: 0.5
+refers_fixed_rope_id: null
+refer_fill_context: False
+refer_fill_context_mode: cycle
+sink_swap_refers: False
+sink_swap_refers_mode: cycle
+sink_swap_refers_after_blocks: 0
+sink_swap_refers_start_slot: 0
+sink_swap_refers_num_slots: -1
+debug_refers_context: True
+
+# local-KV sink / anchor policy
+# The first `sink_size` generated frames are pinned in the local KV cache.
+# With `sink_use_wo_rope_cache`, sink keys are re-RoPE'd to
+# `sink_rope_start_frame` so they stay in a compact training-range position.
+local_attn_size: 21
+sink_size: 3
+sink_rope_start_frame: 0
+sink_use_wo_rope_cache: True
+
+# model
+model_name: Wan2.1-T2V-1.3B
+resume_ckpt: null
+adapter: null
+
+denoising_step_list:
+  - 1000
+  - 740
+  - 500
+  - 260
+warp_denoising_step: True # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+num_frame_per_block: 3
+context_noise: 0
+
+seed: 0
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 8.0
+guidance_scale: 3.0
+mixed_precision: true
+sharding_strategy: hybrid_full
+
+# Data
+data_path: null
+batch_size: 1
+
+# log
+log_iters: 50
+max_iters: 30000
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+output_folder: null

@@ -11,6 +11,12 @@ change_rope: True
 max_context_frames: 6 
 multi_caption: True
 
+# Local-KV sink / anchor policy used by DMD generator rollout.
+local_attn_size: 21
+sink_size: 3
+sink_rope_start_frame: 0
+sink_use_wo_rope_cache: True
+
 model_name: Wan2.1-T2V-1.3B
 resume_ckpt: ckpts/ode_init.pt
 real_name: Wan2.1-T2V-1.3B
