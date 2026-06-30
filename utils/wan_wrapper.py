@@ -151,9 +151,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         )
         self.scheduler.set_timesteps(1000, training=True)
 
-        # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
-        # self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
-        self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 327600 # [1, 21, 16, 60, 104]
+        # Keep the original 21-frame Wan token budget unless an explicitly larger
+        # local window is requested.  A 10x larger default seq_len silently expands
+        # several attention-side buffers during training and can OOM before the
+        # first optimization step.
+        self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:
@@ -247,6 +249,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         condition_frame_number: Optional[int] = None,
         kv_cache_context: Optional[dict] = None,
         shot_flags_for_rope: Optional[torch.Tensor] = None,
+        text_context_indices: Optional[torch.Tensor] = None,
         local_attn_size: Optional[int] = None,
         sink_size: Optional[int] = None,
         use_wo_rope_cache: Optional[bool] = False,
@@ -274,6 +277,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 ###
                 kv_cache_context=kv_cache_context,
                 shot_flags_for_rope=shot_flags_for_rope,
+                text_context_indices=text_context_indices,
                 use_wo_rope_cache=use_wo_rope_cache
                 ###
             ).permute(0, 2, 1, 3, 4)
@@ -309,6 +313,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         causal_use_condition_mask=causal_use_condition_mask,
                         condition_frame_number=condition_frame_number,
                         shot_flags_for_rope=shot_flags_for_rope,
+                        text_context_indices=text_context_indices,
                         local_attn_size=local_attn_size,
                         sink_size=sink_size,
                     ).permute(0, 2, 1, 3, 4)
@@ -318,6 +323,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         t=input_timestep, context=prompt_embeds,  # [b] [b l c]
                         seq_len=self.seq_len,     
                         shot_flags_for_rope=shot_flags_for_rope,
+                        text_context_indices=text_context_indices,
                     ).permute(0, 2, 1, 3, 4)
                     if frameconcat_infer == True:
                         return flow_pred, None #[Note] Disable this line during 2025.11.23 

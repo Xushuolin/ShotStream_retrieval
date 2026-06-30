@@ -115,6 +115,11 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        # When keys are stored without RoPE (use_wo_rope_cache=True), re-apply
+        # RoPE to pinned sink tokens at a compact/fixed temporal position.  This
+        # mirrors the LongLive/Infinite-RoPE style sink behavior where the sink
+        # remains in-range instead of drifting to a very large historical index.
+        self.sink_rope_start_frame = 0
         self.qk_norm = qk_norm
         self.eps = eps
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
@@ -224,9 +229,11 @@ class CausalWanSelfAttention(nn.Module):
                     k, grid_sizes, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope, start_frame=current_start_frame + condition_start_frame).type_as(v)
 
             num_new_tokens = roped_query.shape[1]
+            query_frame_count = max(1, num_new_tokens // frame_seqlen)
             
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen  # sink_size=3
+            cached_local_end_before_insert = kv_cache["local_end_index"].item()
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
 
@@ -248,12 +255,17 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["global_end_index"].item() - num_evicted_tokens  # the end index of the kvcache
                 local_start_index = local_end_index - num_new_tokens  # start index of the kvcache
                                                                                                
-                # Construct full k, v for attention computation (without modifying the original cache)
-                # Create temporary k, v for computation
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                
-                # Apply rolling update to the temporary cache
+                # Update the cache storage in-place and use it directly for
+                # attention.  Cloning the full per-layer KV cache here doubles
+                # peak memory for every cacheful forward and can OOM DMD
+                # training before step 0.  Cache tensors are non-trainable
+                # rollout state, so this matches the original ShotStream memory
+                # behavior while checkpointing remains disabled for cacheful
+                # forwards.
+                temp_k = kv_cache["k"]
+                temp_v = kv_cache["v"]
+
+                # Apply rolling update to the active cache.
                 temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
@@ -274,6 +286,7 @@ class CausalWanSelfAttention(nn.Module):
                 # Save cache update info for later use
                 cache_update_info = {
                     "action": "roll_and_insert",
+                    "already_applied": True,
                     "sink_tokens": sink_tokens,
                     "num_rolled_tokens": num_rolled_tokens,
                     "num_evicted_tokens": num_evicted_tokens,
@@ -281,9 +294,6 @@ class CausalWanSelfAttention(nn.Module):
                     "local_end_index": local_end_index,
                     "write_start_index": write_start_index,
                     "write_end_index": local_end_index,
-                    "new_k": roped_key[:, roped_offset:roped_offset + write_len] if not use_wo_rope_cache else None,
-                    "new_k_wo_rope": k[:, roped_offset:roped_offset + write_len],  # add for without rope
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
                     "current_end": current_end,
                     "is_recompute": is_recompute
                 }
@@ -293,9 +303,10 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
                 
-                # Construct full k, v for attention computation (without modifying the original cache)
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
+                # Use the active cache storage directly.  Avoid cloning full
+                # [B, cache_tokens, heads, dim] K/V tensors on every layer.
+                temp_k = kv_cache["k"]
+                temp_v = kv_cache["v"]
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
                 roped_offset = max(0, write_start_index - local_start_index)
@@ -310,13 +321,11 @@ class CausalWanSelfAttention(nn.Module):
                 # Save cache update info for later use
                 cache_update_info = {
                     "action": "direct_insert",
+                    "already_applied": True,
                     "local_start_index": local_start_index,
                     "local_end_index": local_end_index,
                     "write_start_index": write_start_index,
                     "write_end_index": local_end_index,
-                    "new_k": roped_key[:, roped_offset:roped_offset + write_len] if not use_wo_rope_cache else None,
-                    "new_k_wo_rope": k[:, roped_offset:roped_offset + write_len],  # add for without rope
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
                     "current_end": current_end,
                     "is_recompute": is_recompute
                 }
@@ -325,24 +334,57 @@ class CausalWanSelfAttention(nn.Module):
             # Use temporary k, v to compute attention
             if sink_tokens > 0:  # [TODO]
                 # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
+                # Only frames that were already present in the cache before this
+                # forward call may act as sink. Newly generated frames should first
+                # be generated with normal/local RoPE, then become sink for later
+                # blocks after the clean-cache update.
+                active_sink_tokens = min(sink_tokens, cached_local_end_before_insert, local_end_index)
+                local_budget = self.max_attention_size - active_sink_tokens
+                k_sink = temp_k[:, :active_sink_tokens]
                 if use_wo_rope_cache:
-                    k_sink = causal_rope_apply_dynamic(k_sink, grid_sizes, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope, start_frame=condition_start_frame).type_as(v)   
-                v_sink = temp_v[:, :sink_tokens]
+                    sink_frame_count = k_sink.shape[1] // frame_seqlen
+                    if sink_frame_count > 0:
+                        grid_sizes_for_sink = grid_sizes.clone()
+                        grid_sizes_for_sink[0][0] = sink_frame_count
+                        sink_flag = 0
+                        if shot_flags_for_rope is not None and shot_flags_for_rope.numel() > 0:
+                            sink_flag = int(shot_flags_for_rope[0].item())
+                        shot_flags_for_rope_sink = torch.full(
+                            (sink_frame_count,),
+                            sink_flag,
+                            dtype=torch.int32,
+                            device=v.device,
+                        )
+                        k_sink = causal_rope_apply_dynamic(
+                            k_sink,
+                            grid_sizes_for_sink,
+                            freqs=freqs_dynamic,
+                            shot_flags_for_rope=shot_flags_for_rope_sink,
+                            start_frame=condition_start_frame + int(self.sink_rope_start_frame),
+                        ).type_as(v)
+                v_sink = temp_v[:, :active_sink_tokens]
                 # add for context
-                k_context =  kv_cache_context["k"].clone()
-                v_context = kv_cache_context["v"].clone()
+                k_context = kv_cache_context["k"]
+                v_context = kv_cache_context["v"]
 
                 if local_budget > 0:
-                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
+                    local_start_for_window = max(active_sink_tokens, local_end_index - local_budget)
                     k_local = temp_k[:, local_start_for_window:local_end_index]
-                    if use_wo_rope_cache:
-                        # rope_start_frame = rope_end_frame - k_local.shape[1] // 1560
-                        shot_flags_for_rope_local = torch.tensor([shot_flags_for_rope[0].item()] * (k_local.shape[1] // 1560)).to(torch.int32).to(v.device) 
+                    local_frame_count = k_local.shape[1] // frame_seqlen
+                    if use_wo_rope_cache and local_frame_count > 0:
+                        local_key_rope_start_frame = max(
+                            condition_start_frame + (active_sink_tokens // frame_seqlen),
+                            rope_start_frame - max(0, local_frame_count - query_frame_count),
+                        )
+                        shot_flags_for_rope_local = torch.full(
+                            (local_frame_count,),
+                            int(shot_flags_for_rope[0].item()),
+                            dtype=torch.int32,
+                            device=v.device,
+                        )
                         grid_sizes_for_local = grid_sizes.clone()
-                        grid_sizes_for_local[0][0] = k_local.shape[1] // 1560
-                        k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=rope_start_frame).type_as(v)
+                        grid_sizes_for_local[0][0] = local_frame_count
+                        k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=local_key_rope_start_frame).type_as(v)
                     # print(f"use wo rope cache")
                     # print(f"rope_start_frame is {rope_start_frame}")
                     # print(f"shot_flags_for_rope is {shot_flags_for_rope}")
@@ -360,18 +402,25 @@ class CausalWanSelfAttention(nn.Module):
                 )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
-                k_context =  kv_cache_context["k"].clone()
-                v_context = kv_cache_context["v"].clone()
+                k_context = kv_cache_context["k"]
+                v_context = kv_cache_context["v"]
                 k_local = temp_k[:, window_start:local_end_index]
                 v_local = temp_v[:, window_start:local_end_index]
-                if use_wo_rope_cache:
-                    # rope_start_frame = rope_end_frame - k_local.shape[1] // 1560
-                    # rope_start_frame = current_start_frame + condition_start_frame  - (k_local.shape[1] // 1560 - 3)
-                    rope_start_frame = 6
-                    shot_flags_for_rope_local = torch.tensor([shot_flags_for_rope[0].item()] * (k_local.shape[1] // 1560)).to(torch.int32).to(v.device) 
+                local_frame_count = k_local.shape[1] // frame_seqlen
+                if use_wo_rope_cache and local_frame_count > 0:
+                    local_key_rope_start_frame = max(
+                        condition_start_frame,
+                        rope_start_frame - max(0, local_frame_count - query_frame_count),
+                    )
+                    shot_flags_for_rope_local = torch.full(
+                        (local_frame_count,),
+                        int(shot_flags_for_rope[0].item()),
+                        dtype=torch.int32,
+                        device=v.device,
+                    )
                     grid_sizes_for_local = grid_sizes.clone()
-                    grid_sizes_for_local[0][0] = k_local.shape[1] // 1560
-                    k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=rope_start_frame).type_as(v)
+                    grid_sizes_for_local[0][0] = local_frame_count
+                    k_local = causal_rope_apply_dynamic(k_local, grid_sizes_for_local, freqs=freqs_dynamic, shot_flags_for_rope=shot_flags_for_rope_local, start_frame=local_key_rope_start_frame).type_as(v)
                     # print(f"[DEBUG] Key: rope_start_frame is {rope_start_frame}  Key latent number is {k_local.shape[1] // 1560}  shot_flags_for_rope is {shot_flags_for_rope_local}")
 
                 k_cat = torch.cat([k_context, k_local], dim=1)
@@ -477,6 +526,7 @@ class CausalWanAttentionBlock(nn.Module):
         ###
         kv_cache_context=None,
         shot_flags_for_rope=None,
+        text_context_indices=None,
         freqs_dynamic=None,
         use_wo_rope_cache=False,
         ###
@@ -517,9 +567,16 @@ class CausalWanAttentionBlock(nn.Module):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None, grid_sizes=None, shot_flags_for_rope=None):
-            x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache, grid_sizes=grid_sizes, shot_flags_for_rope=shot_flags_for_rope)
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None, grid_sizes=None, shot_flags_for_rope=None, text_context_indices=None):
+            x = x + self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                crossattn_cache=crossattn_cache,
+                grid_sizes=grid_sizes,
+                shot_flags_for_rope=shot_flags_for_rope,
+                text_context_indices=text_context_indices,
+            )
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -529,7 +586,7 @@ class CausalWanAttentionBlock(nn.Module):
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache, grid_sizes, shot_flags_for_rope)
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache, grid_sizes, shot_flags_for_rope, text_context_indices)
         
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
@@ -717,8 +774,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
             if update_info is not None:
                 cache = kv_cache[block_index]
-                
-                if update_info["action"] == "roll_and_insert":
+
+                if update_info.get("already_applied", False):
+                    # K/V contents were updated in-place during the block
+                    # forward to avoid full-cache clones.  Only advance cache
+                    # pointers below.
+                    pass
+                elif update_info["action"] == "roll_and_insert":
                     # Apply rolling update
                     sink_tokens = update_info["sink_tokens"]
                     num_rolled_tokens = update_info["num_rolled_tokens"]
@@ -794,6 +856,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         ###
         kv_cache_context: dict = None,  # list, 30, kv_cache_context[0].keys() dict_keys(['k', 'v', 'is_init'])
         shot_flags_for_rope: torch.Tensor = None,
+        text_context_indices: torch.Tensor = None,
         use_wo_rope_cache: bool = False,  # whether use rope cache
         ###
         current_start: int = 0,  # token number
@@ -898,6 +961,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             ###
             freqs_dynamic=self.freqs_dynamic,
             shot_flags_for_rope=shot_flags_for_rope,
+            text_context_indices=text_context_indices,
             use_wo_rope_cache=use_wo_rope_cache,
             ###
         )
@@ -911,7 +975,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_update_infos = []  # Collect cache update info for all blocks
         for block_index, block in enumerate(self.blocks):
             # print(f"block_index: {block_index}")
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            # Activation checkpointing re-runs the block during backward.  In
+            # causal rollout/training the KV caches are intentionally mutated
+            # after the original forward (see _apply_cache_updates below), so
+            # recomputation would observe a newer cache state than the original
+            # checkpointed forward.  That can change sink/local-window branches
+            # and trip PyTorch's non-reentrant checkpoint metadata checks
+            # ("different number of tensors saved").  Keep checkpointing for
+            # stateless/non-cache forwards, but run cacheful forwards normally.
+            can_checkpoint = (
+                torch.is_grad_enabled()
+                and self.gradient_checkpointing
+                and kv_cache is None
+                and kv_cache_context is None
+            )
+            if can_checkpoint:
                 kwargs.update(
                     {
                         # "kv_cache": kv_cache[block_index],
@@ -986,6 +1064,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         causal_use_condition_mask=False,
         condition_frame_number=None,
         shot_flags_for_rope=None,
+        text_context_indices=None,
         local_attn_size=None,
         sink_size=None,
     ):
@@ -1134,6 +1213,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             ###
             freqs_dynamic=self.freqs_dynamic,
             shot_flags_for_rope=shot_flags_for_rope,
+            text_context_indices=text_context_indices,
             ###
             )
             # block_mask=self.block_mask)

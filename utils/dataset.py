@@ -3,6 +3,7 @@
 from torch.utils.data import Dataset
 import torch
 import json
+import os
 import datasets
 import pandas as pd
 
@@ -166,12 +167,22 @@ class MultiShots_FrameConcat_Dataset(Dataset):
                         # shots_caption.append([f'shot{i}:' + caption_content[f'shot{i}']])
                         shots_caption.append([f'shot{i}:' + caption_content[f'shot{i+1}']])  # [NOTE] data index begin with Shot 1
                     shots_captions.append(shots_caption) 
+                refers = caption_content.get("refers", [])
+                caption_json_dir = os.path.dirname(caption_json_path)
+                for refer in refers:
+                    if not isinstance(refer, dict) or "image_path" not in refer:
+                        continue
+                    image_path = refer["image_path"]
+                    if os.path.isabs(image_path) or os.path.exists(image_path):
+                        continue
+                    refer["image_path"] = os.path.join(caption_json_dir, image_path)
                 if self.video_path is not None:
                     batch = {
                         "data_path": video_path if self.video_path is not None else None,
                         "data": frames if self.video_path is not None else None,
                         "global_captions": global_captions,
                         "shots_captions": shots_captions,
+                        "refers": refers,
                         "shot_flag": shot_flag if self.frame_number is not None else None,
                         "idx": idx,
                     }
@@ -179,6 +190,7 @@ class MultiShots_FrameConcat_Dataset(Dataset):
                     batch = {
                         "global_captions": global_captions,
                         "shots_captions": shots_captions,
+                        "refers": refers,
                         "shot_flag": shot_flag,
                         "idx": idx,
                     }
@@ -208,12 +220,14 @@ class MultiShots_FrameConcat_Dataset(Dataset):
         global_captions  = [example["global_captions"] for example in examples]
         shots_captions  = [example["shots_captions"] for example in examples]
         shot_flag  = [example["shot_flag"] for example in examples]
+        refers = [example.get("refers", []) for example in examples]
         idx  = [example["idx"] for example in examples]
         return {
                 "data_path": data_paths,
                 "data": data,
                 "global_captions": global_captions,
                 "shots_captions": shots_captions,
+                "refers": refers,
                 "shot_flag": shot_flag,
                 "idx": idx,
             }
