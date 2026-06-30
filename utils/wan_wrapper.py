@@ -151,9 +151,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         )
         self.scheduler.set_timesteps(1000, training=True)
 
-        # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
-        # self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
-        self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 327600 # [1, 21, 16, 60, 104]
+        # Keep the original 21-frame Wan token budget unless an explicitly larger
+        # local window is requested.  A 10x larger default seq_len silently expands
+        # several attention-side buffers during training and can OOM before the
+        # first optimization step.
+        self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:

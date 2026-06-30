@@ -255,12 +255,17 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["global_end_index"].item() - num_evicted_tokens  # the end index of the kvcache
                 local_start_index = local_end_index - num_new_tokens  # start index of the kvcache
                                                                                                
-                # Construct full k, v for attention computation (without modifying the original cache)
-                # Create temporary k, v for computation
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                
-                # Apply rolling update to the temporary cache
+                # Update the cache storage in-place and use it directly for
+                # attention.  Cloning the full per-layer KV cache here doubles
+                # peak memory for every cacheful forward and can OOM DMD
+                # training before step 0.  Cache tensors are non-trainable
+                # rollout state, so this matches the original ShotStream memory
+                # behavior while checkpointing remains disabled for cacheful
+                # forwards.
+                temp_k = kv_cache["k"]
+                temp_v = kv_cache["v"]
+
+                # Apply rolling update to the active cache.
                 temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
@@ -281,6 +286,7 @@ class CausalWanSelfAttention(nn.Module):
                 # Save cache update info for later use
                 cache_update_info = {
                     "action": "roll_and_insert",
+                    "already_applied": True,
                     "sink_tokens": sink_tokens,
                     "num_rolled_tokens": num_rolled_tokens,
                     "num_evicted_tokens": num_evicted_tokens,
@@ -288,9 +294,6 @@ class CausalWanSelfAttention(nn.Module):
                     "local_end_index": local_end_index,
                     "write_start_index": write_start_index,
                     "write_end_index": local_end_index,
-                    "new_k": roped_key[:, roped_offset:roped_offset + write_len] if not use_wo_rope_cache else None,
-                    "new_k_wo_rope": k[:, roped_offset:roped_offset + write_len],  # add for without rope
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
                     "current_end": current_end,
                     "is_recompute": is_recompute
                 }
@@ -300,9 +303,10 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
                 
-                # Construct full k, v for attention computation (without modifying the original cache)
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
+                # Use the active cache storage directly.  Avoid cloning full
+                # [B, cache_tokens, heads, dim] K/V tensors on every layer.
+                temp_k = kv_cache["k"]
+                temp_v = kv_cache["v"]
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
                 roped_offset = max(0, write_start_index - local_start_index)
@@ -317,13 +321,11 @@ class CausalWanSelfAttention(nn.Module):
                 # Save cache update info for later use
                 cache_update_info = {
                     "action": "direct_insert",
+                    "already_applied": True,
                     "local_start_index": local_start_index,
                     "local_end_index": local_end_index,
                     "write_start_index": write_start_index,
                     "write_end_index": local_end_index,
-                    "new_k": roped_key[:, roped_offset:roped_offset + write_len] if not use_wo_rope_cache else None,
-                    "new_k_wo_rope": k[:, roped_offset:roped_offset + write_len],  # add for without rope
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
                     "current_end": current_end,
                     "is_recompute": is_recompute
                 }
@@ -362,8 +364,8 @@ class CausalWanSelfAttention(nn.Module):
                         ).type_as(v)
                 v_sink = temp_v[:, :active_sink_tokens]
                 # add for context
-                k_context =  kv_cache_context["k"].clone()
-                v_context = kv_cache_context["v"].clone()
+                k_context = kv_cache_context["k"]
+                v_context = kv_cache_context["v"]
 
                 if local_budget > 0:
                     local_start_for_window = max(active_sink_tokens, local_end_index - local_budget)
@@ -400,8 +402,8 @@ class CausalWanSelfAttention(nn.Module):
                 )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
-                k_context =  kv_cache_context["k"].clone()
-                v_context = kv_cache_context["v"].clone()
+                k_context = kv_cache_context["k"]
+                v_context = kv_cache_context["v"]
                 k_local = temp_k[:, window_start:local_end_index]
                 v_local = temp_v[:, window_start:local_end_index]
                 local_frame_count = k_local.shape[1] // frame_seqlen
@@ -772,8 +774,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
             if update_info is not None:
                 cache = kv_cache[block_index]
-                
-                if update_info["action"] == "roll_and_insert":
+
+                if update_info.get("already_applied", False):
+                    # K/V contents were updated in-place during the block
+                    # forward to avoid full-cache clones.  Only advance cache
+                    # pointers below.
+                    pass
+                elif update_info["action"] == "roll_and_insert":
                     # Apply rolling update
                     sink_tokens = update_info["sink_tokens"]
                     num_rolled_tokens = update_info["num_rolled_tokens"]
